@@ -2,9 +2,8 @@ use anyhow::{anyhow, bail, Context};
 use std::{cell::RefCell, fmt::Debug, path::Path, rc::Rc, str::from_utf8};
 
 use crate::{
-    constants::{
-        EMAIL_OFFSET, ID_OFFSET, ROWS_PER_PAGE, ROWS_SIZE, TABLE_MAX_ROWS, USERNAME_OFFSET,
-    },
+    constants::{EMAIL_OFFSET, ID_OFFSET, ROWS_SIZE, TABLE_MAX_ROWS, USERNAME_OFFSET},
+    cursor::Cursor,
     pager::Pager,
 };
 
@@ -137,9 +136,8 @@ impl Row {
 
 #[derive(Debug)]
 pub struct Table {
-    num_rows: usize,
-    // pages: Vec<Page>,
-    pager: Pager,
+    pub num_rows: usize,
+    pub pager: Rc<RefCell<Pager>>,
 }
 
 impl Table {
@@ -147,21 +145,13 @@ impl Table {
         let pager = Pager::new(p)?;
         Ok(Self {
             num_rows: pager.file_len / ROWS_SIZE,
-            pager,
+            pager: Rc::new(RefCell::new(pager)),
         })
     }
 
     /// Consumes Table and saves all content to file.
     pub fn close(self) -> anyhow::Result<()> {
-        self.pager.flush()
-    }
-
-    fn row_slot(&mut self, row_num: usize) -> anyhow::Result<Option<Rc<RefCell<Vec<u8>>>>> {
-        let page_num = row_num / ROWS_PER_PAGE;
-        let page = self.pager.get_page(page_num)?;
-
-        let x = Ok(Some(page.try_borrow_mut()?.get(row_num % ROWS_PER_PAGE)?));
-        x
+        Rc::try_unwrap(self.pager).unwrap().into_inner().flush()
     }
 
     pub fn insert(&mut self, r: &Row) -> anyhow::Result<()> {
@@ -170,7 +160,9 @@ impl Table {
         }
 
         let mut data = r.serialize();
-        match self.row_slot(self.num_rows)? {
+        let cursor = self.cursor_end();
+
+        match cursor.cursor_value()? {
             Some(place) => {
                 place.try_borrow_mut()?.append(&mut data);
                 println!("saved");
@@ -183,33 +175,33 @@ impl Table {
         Ok(())
     }
 
-    #[cfg(test)]
     fn collect(&mut self) -> anyhow::Result<Vec<Row>> {
         let mut rows = vec![];
-        for i in 0..self.num_rows {
-            match self.row_slot(i)? {
+        let mut cursor = self.cursor_start();
+
+        while !cursor.end_of_table {
+            match cursor.cursor_value()? {
                 Some(place) => {
                     let row = Row::deserialize(&place.borrow().clone())?;
                     rows.push(row);
                 }
                 None => bail!("could not find row in saved content"),
             }
+            cursor.advance(self.num_rows)
         }
         Ok(rows)
     }
 
-    pub fn select(&mut self) -> anyhow::Result<()> {
-        for i in 0..self.num_rows {
-            match self.row_slot(i)? {
-                Some(place) => {
-                    let row = Row::deserialize(&place.borrow().clone())?;
+    pub fn select(&mut self) {
+        self.collect().into_iter().for_each(|r| println!("{:?}", r));
+    }
 
-                    println!("row {}, {:?}", i, row)
-                }
-                None => bail!("could not find row in saved content"),
-            }
-        }
-        Ok(())
+    pub fn cursor_start(&mut self) -> Cursor {
+        Cursor::new(self.pager.clone(), 0, self.num_rows == 0)
+    }
+
+    pub fn cursor_end(&mut self) -> Cursor {
+        Cursor::new(self.pager.clone(), self.num_rows, true)
     }
 }
 

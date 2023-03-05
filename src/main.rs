@@ -8,6 +8,7 @@ use crate::table::Table;
 #[allow(dead_code)]
 mod cli;
 mod constants;
+mod cursor;
 mod pager;
 mod table;
 
