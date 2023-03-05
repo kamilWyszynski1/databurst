@@ -14,42 +14,40 @@ fn report(err: anyhow::Error) {
     }
 }
 
-pub fn input_loop(mut table: Table) {
+pub fn input_loop(mut table: Table) -> anyhow::Result<()> {
     loop {
         print!("lipsy>: ");
 
         let mut input = String::new();
         match io::stdin().read_line(&mut input) {
-            Ok(_) => match parse_input(input, &mut table) {
-                Ok(_) => {}
-                Err(err) => report(err),
-            },
+            Ok(_) => {
+                if let Some(query) = parse_query(input)? {
+                    match query {
+                        Query::Select => {
+                            table.select()?;
+                        }
+                        Query::Insert(id, username, email) => {
+                            table.insert(&Row::try_from((id, username, email))?)?;
+                        }
+                        Query::Exit => break,
+                    }
+                }
+            }
             Err(err) => {
                 println!("error when reading input, {}", err);
-                return;
+                break;
             }
         }
         stdout().flush().unwrap();
     }
-}
-
-fn parse_input(input: String, table: &mut Table) -> anyhow::Result<()> {
-    if let Some(query) = parse_query(input)? {
-        match query {
-            Query::Select => table.into_iter().for_each(|r| println!("{:?}", r)),
-            Query::Insert(id, username, email) => {
-                table.insert(&Row::try_from((id, username, email))?)?;
-            }
-        }
-    }
-
-    Ok(())
+    table.close()
 }
 
 #[derive(Debug, PartialEq)]
 enum Query {
     Select,
     Insert(u32, String, String),
+    Exit,
 }
 
 fn parse_query<S: Into<String>>(input: S) -> anyhow::Result<Option<Query>> {
@@ -73,6 +71,7 @@ fn parse_query<S: Into<String>>(input: S) -> anyhow::Result<Option<Query>> {
                 .to_string();
             Ok(Some(Query::Insert(value1, value2, value3)))
         }
+        Some("exit") => Ok(Some(Query::Exit)),
         _ => Ok(None),
     }
 }
