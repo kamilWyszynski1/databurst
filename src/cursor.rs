@@ -9,7 +9,7 @@ pub struct Cursor {
     pub end_of_table: bool,
 
     page_num: usize,
-    cell_num: usize,
+    pub cell_num: usize,
 }
 
 impl Cursor {
@@ -44,7 +44,8 @@ impl Cursor {
         match &mut node.node_type {
             crate::node::NodeType::Internal(_, _) => todo!(),
             crate::node::NodeType::Leaf(ref mut kvs) => {
-                kvs.push((key, data.to_vec()));
+                // cell_num was set by binary search, it will be inserted in order
+                kvs.insert(self.cell_num, (key, data.to_vec()));
             }
         }
 

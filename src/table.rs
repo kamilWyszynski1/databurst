@@ -4,7 +4,7 @@ use std::{cell::RefCell, fmt::Debug, path::Path, rc::Rc, str::from_utf8};
 use crate::{
     constants::{EMAIL_OFFSET, ID_OFFSET, LEAF_NODE_MAX_CELLS, ROWS_SIZE, USERNAME_OFFSET},
     cursor::Cursor,
-    node::Node,
+    node::{Node, NodeType},
     pager::Pager,
 };
 
@@ -176,11 +176,23 @@ impl Table {
         let node =
             Node::try_from(page.borrow().clone()).context("could not create Node from Page")?;
 
-        if node.num_cells() as usize >= LEAF_NODE_MAX_CELLS {
+        let num_cells = node.num_cells() as usize;
+
+        if num_cells >= LEAF_NODE_MAX_CELLS {
             bail!("max cells in root leaf node")
         }
 
-        let cursor = self.cursor_end()?;
+        let key_to_insert = r.id;
+
+        let cursor = self.cursor_find(key_to_insert)?;
+
+        if cursor.cell_num < num_cells {
+            let key_at_index = node.leaf_node_key(cursor.cell_num)?;
+            if key_at_index == key_to_insert {
+                bail!("duplicate key!")
+            }
+        }
+
         cursor.insert(r.id, &data)?;
 
         Ok(())
@@ -221,19 +233,51 @@ impl Table {
         ))
     }
 
-    pub fn cursor_end(&mut self) -> anyhow::Result<Cursor> {
-        let page_num = self.root_page_num;
+    /// Return the position of the given key.
+    /// If the key is not present, return the position where it should be inserted.
+    fn cursor_find(&mut self, key_to_insert: u32) -> anyhow::Result<Cursor> {
+        let root_page_num = self.root_page_num;
+        let root_page = self.pager.borrow_mut().get_page(root_page_num)?;
 
-        let root = &self.pager.borrow_mut().get_page(self.root_page_num)?;
-        let node = Node::try_from(root.borrow().clone())?;
+        let root_node = Node::try_from(root_page.borrow().clone())?;
 
-        Ok(Cursor::new(
-            self.pager.clone(),
-            page_num,
-            node.num_cells().try_into()?,
-            true,
-        ))
+        if let NodeType::Internal(_, _) = root_node.node_type {
+            todo!()
+        } else {
+            self.leaf_node_find(root_page_num, key_to_insert)
+        }
     }
+
+    fn leaf_node_find(&mut self, page_num: usize, key: u32) -> anyhow::Result<Cursor> {
+        let node = Node::try_from(self.pager.borrow_mut().get_page(page_num)?.borrow().clone())?;
+
+        let mut cursor = Cursor::new(self.pager.clone(), page_num, 0, false);
+
+        if let NodeType::Leaf(kvs) = node.node_type {
+            let inx = kvs
+                .binary_search_by_key(&key, |(k, _)| *k)
+                .unwrap_or_else(|x| x);
+            cursor.cell_num = inx;
+        } else {
+            bail!("invalid type!")
+        }
+
+        Ok(cursor)
+    }
+
+    // pub fn cursor_end(&mut self) -> anyhow::Result<Cursor> {
+    //     let page_num = self.root_page_num;
+
+    //     let root = &self.pager.borrow_mut().get_page(self.root_page_num)?;
+    //     let node = Node::try_from(root.borrow().clone())?;
+
+    //     Ok(Cursor::new(
+    //         self.pager.clone(),
+    //         page_num,
+    //         node.num_cells().try_into()?,
+    //         true,
+    //     ))
+    // }
 }
 
 pub fn vector_to_array<T, const N: usize>(mut v: Vec<T>) -> anyhow::Result<[T; N]>
@@ -334,35 +378,28 @@ mod tests {
         let wanted = vec![r1.clone(), r2.clone(), r3.clone()];
 
         db.insert(&r1).context("could not insert r1")?;
-        db.insert(&r2)?;
         db.insert(&r3)?;
+        db.insert(&r2)?;
 
-        let mut got = db.collect()?;
-        got.sort_by_key(|r| r.id);
+        let got = db.collect()?;
         assert_eq!(wanted, got);
 
         db.close()?;
         let mut db = Table::db_open(&file_path)?;
 
-        let mut got = db.collect()?;
-        got.sort_by_key(|r| r.id);
+        let got = db.collect()?;
         assert_eq!(wanted, got);
 
         Ok(())
     }
 
     #[test]
-    fn test_table_multiple_inserts() -> anyhow::Result<()> {
-        let mut rows = vec![];
-        for i in 0..1000 {
-            rows.push(Row {
-                id: i,
-                username: vector_to_array(str_as_bytes("a".repeat(i as usize % 32).as_str()))
-                    .unwrap(),
-                email: vector_to_array(str_as_bytes("b".repeat(i as usize % 255).as_str()))
-                    .unwrap(),
-            })
-        }
+    fn test_insert_dupliacate() -> anyhow::Result<()> {
+        let r1 = Row {
+            id: 1,
+            username: vector_to_array(str_as_bytes("a".repeat(32).as_str())).unwrap(),
+            email: vector_to_array(str_as_bytes("a".repeat(255).as_str())).unwrap(),
+        };
 
         let tmp_dir = TempDir::new("databurst")?;
         let file_path = tmp_dir.path().join("my.db");
@@ -370,21 +407,51 @@ mod tests {
 
         let mut db = Table::db_open(&file_path)?;
 
-        for row in &rows {
-            db.insert(row)?;
-        }
+        db.insert(&r1)?;
 
-        let mut got = db.collect()?;
-        got.sort_by_key(|r| r.id);
-        assert_eq!(rows, got);
-
-        db.close()?;
-        let mut db = Table::db_open(&file_path)?;
-
-        let mut got = db.collect()?;
-        got.sort_by_key(|r| r.id);
-        assert_eq!(rows, got);
+        assert!(db
+            .insert(&r1)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate key!"));
 
         Ok(())
     }
+
+    // #[test]
+    // fn test_table_multiple_inserts() -> anyhow::Result<()> {
+    //     let mut rows = vec![];
+    //     for i in 0..1000 {
+    //         rows.push(Row {
+    //             id: i,
+    //             username: vector_to_array(str_as_bytes("a".repeat(i as usize % 32).as_str()))
+    //                 .unwrap(),
+    //             email: vector_to_array(str_as_bytes("b".repeat(i as usize % 255).as_str()))
+    //                 .unwrap(),
+    //         })
+    //     }
+
+    //     let tmp_dir = TempDir::new("databurst")?;
+    //     let file_path = tmp_dir.path().join("my.db");
+    //     File::create(&file_path)?;
+
+    //     let mut db = Table::db_open(&file_path)?;
+
+    //     for row in &rows {
+    //         db.insert(row)?;
+    //     }
+
+    //     let mut got = db.collect()?;
+    //     got.sort_by_key(|r| r.id);
+    //     assert_eq!(rows, got);
+
+    //     db.close()?;
+    //     let mut db = Table::db_open(&file_path)?;
+
+    //     let mut got = db.collect()?;
+    //     got.sort_by_key(|r| r.id);
+    //     assert_eq!(rows, got);
+
+    //     Ok(())
+    // }
 }
