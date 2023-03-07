@@ -2,8 +2,9 @@ use anyhow::{anyhow, bail, Context};
 use std::{cell::RefCell, fmt::Debug, path::Path, rc::Rc, str::from_utf8};
 
 use crate::{
-    constants::{EMAIL_OFFSET, ID_OFFSET, ROWS_SIZE, TABLE_MAX_ROWS, USERNAME_OFFSET},
+    constants::{EMAIL_OFFSET, ID_OFFSET, LEAF_NODE_MAX_CELLS, ROWS_SIZE, USERNAME_OFFSET},
     cursor::Cursor,
+    node::Node,
     pager::Pager,
 };
 
@@ -107,7 +108,7 @@ impl Row {
         buffer
     }
 
-    fn deserialize(data: &[u8]) -> anyhow::Result<Row> {
+    pub fn deserialize(data: &[u8]) -> anyhow::Result<Row> {
         if data.len() < ROWS_SIZE {
             bail!("data size is too small")
         }
@@ -136,15 +137,25 @@ impl Row {
 
 #[derive(Debug)]
 pub struct Table {
-    pub num_rows: usize,
+    pub root_page_num: usize,
     pub pager: Rc<RefCell<Pager>>,
 }
 
 impl Table {
     pub fn db_open<P: AsRef<Path>>(p: P) -> anyhow::Result<Self> {
-        let pager = Pager::new(p)?;
+        let mut pager = Pager::new(p)?;
+
+        if pager.num_pages == 0 {
+            // new database, need to initialize
+            // TODO: init
+            let root = pager.get_page(0)?;
+            let mut node = Node::try_from(root.borrow().clone())?;
+            node.is_root = true;
+            root.borrow_mut().data = node.try_into()?;
+        }
+
         Ok(Self {
-            num_rows: pager.file_len / ROWS_SIZE,
+            root_page_num: 0,
             pager: Rc::new(RefCell::new(pager)),
         })
     }
@@ -155,39 +166,36 @@ impl Table {
     }
 
     pub fn insert(&mut self, r: &Row) -> anyhow::Result<()> {
-        if self.num_rows >= TABLE_MAX_ROWS {
-            bail!("table is full")
+        let data = r.serialize();
+
+        let page = self
+            .pager
+            .borrow_mut()
+            .get_page(self.root_page_num)
+            .with_context(|| format!("could not read {} page", self.root_page_num))?;
+        let node =
+            Node::try_from(page.borrow().clone()).context("could not create Node from Page")?;
+
+        if node.num_cells() as usize >= LEAF_NODE_MAX_CELLS {
+            bail!("max cells in root leaf node")
         }
 
-        let mut data = r.serialize();
-        let cursor = self.cursor_end();
-
-        match cursor.cursor_value()? {
-            Some(place) => {
-                place.try_borrow_mut()?.append(&mut data);
-                println!("saved");
-            }
-            None => bail!("could not find place to save row"),
-        }
-
-        self.num_rows += 1;
+        let cursor = self.cursor_end()?;
+        cursor.insert(r.id, &data)?;
 
         Ok(())
     }
 
     fn collect(&mut self) -> anyhow::Result<Vec<Row>> {
         let mut rows = vec![];
-        let mut cursor = self.cursor_start();
+        let mut cursor = self.cursor_start()?;
 
         while !cursor.end_of_table {
-            match cursor.cursor_value()? {
-                Some(place) => {
-                    let row = Row::deserialize(&place.borrow().clone())?;
-                    rows.push(row);
-                }
-                None => bail!("could not find row in saved content"),
-            }
-            cursor.advance(self.num_rows)
+            let row_bytes = cursor.cursor_value()?;
+            let row = Row::deserialize(&row_bytes)?;
+            rows.push(row);
+
+            cursor.advance()?;
         }
         Ok(rows)
     }
@@ -196,12 +204,35 @@ impl Table {
         self.collect().into_iter().for_each(|r| println!("{:?}", r));
     }
 
-    pub fn cursor_start(&mut self) -> Cursor {
-        Cursor::new(self.pager.clone(), 0, self.num_rows == 0)
+    pub fn cursor_start(&mut self) -> anyhow::Result<Cursor> {
+        let page_num = self.root_page_num;
+        let cell_num = 0;
+
+        let root = self.pager.borrow_mut().get_page(self.root_page_num)?;
+        let node = Node::try_from(root.borrow().clone())?;
+
+        let num_cells = node.num_cells();
+
+        Ok(Cursor::new(
+            self.pager.clone(),
+            page_num,
+            cell_num,
+            num_cells == 0,
+        ))
     }
 
-    pub fn cursor_end(&mut self) -> Cursor {
-        Cursor::new(self.pager.clone(), self.num_rows, true)
+    pub fn cursor_end(&mut self) -> anyhow::Result<Cursor> {
+        let page_num = self.root_page_num;
+
+        let root = &self.pager.borrow_mut().get_page(self.root_page_num)?;
+        let node = Node::try_from(root.borrow().clone())?;
+
+        Ok(Cursor::new(
+            self.pager.clone(),
+            page_num,
+            node.num_cells().try_into()?,
+            true,
+        ))
     }
 }
 
@@ -225,7 +256,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use anyhow::Ok;
+    use anyhow::{Context, Ok};
     use tempdir::TempDir;
 
     use super::{vector_to_array, Row, Table};
@@ -302,7 +333,7 @@ mod tests {
 
         let wanted = vec![r1.clone(), r2.clone(), r3.clone()];
 
-        db.insert(&r1)?;
+        db.insert(&r1).context("could not insert r1")?;
         db.insert(&r2)?;
         db.insert(&r3)?;
 

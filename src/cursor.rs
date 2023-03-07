@@ -1,36 +1,69 @@
 use std::{cell::RefCell, rc::Rc};
 
-use crate::{constants::ROWS_PER_PAGE, pager::Pager};
+use anyhow::Ok;
+
+use crate::{node::Node, pager::Pager};
 
 pub struct Cursor {
     pager: Rc<RefCell<Pager>>,
-    row_num: usize,
     pub end_of_table: bool,
+
+    page_num: usize,
+    cell_num: usize,
 }
 
 impl Cursor {
-    pub fn new(pager: Rc<RefCell<Pager>>, row_num: usize, end_of_table: bool) -> Self {
+    pub fn new(
+        pager: Rc<RefCell<Pager>>,
+        page_num: usize,
+        cell_num: usize,
+        end_of_table: bool,
+    ) -> Self {
         Self {
             pager,
-            row_num,
+            cell_num,
+            page_num,
             end_of_table,
         }
     }
 
-    pub fn cursor_value(&self) -> anyhow::Result<Option<Rc<RefCell<Vec<u8>>>>> {
-        let page_num = self.row_num / ROWS_PER_PAGE;
-        let page = self.pager.try_borrow_mut()?.get_page(page_num)?;
+    pub fn cursor_value(&self) -> anyhow::Result<Vec<u8>> {
+        let page = self.pager.try_borrow_mut()?.get_page(self.page_num)?;
+        let node = Node::try_from(page.borrow().clone())?;
 
-        let x = Ok(Some(
-            page.try_borrow_mut()?.get(self.row_num % ROWS_PER_PAGE)?,
-        ));
-        x
+        Ok(node.leaf_node_value(self.cell_num)?)
     }
 
-    pub fn advance(&mut self, table_rows_num: usize) {
-        self.row_num += 1;
-        if self.row_num >= table_rows_num {
+    pub fn insert(&self, key: u32, data: &[u8]) -> anyhow::Result<()> {
+        let page = self.pager.try_borrow_mut()?.get_page(self.page_num)?;
+
+        // turn page's bytes into readable node
+        let mut node = Node::try_from(page.borrow().clone())?;
+
+        // insert value
+        match &mut node.node_type {
+            crate::node::NodeType::Internal(_, _) => todo!(),
+            crate::node::NodeType::Leaf(ref mut kvs) => {
+                kvs.push((key, data.to_vec()));
+            }
+        }
+
+        // turn node back into bytes
+        page.borrow_mut().data = node.try_into()?;
+
+        Ok(())
+    }
+
+    pub fn advance(&mut self) -> anyhow::Result<()> {
+        let page_num = self.page_num;
+        let node = Node::try_from(self.pager.borrow_mut().get_page(page_num)?.borrow().clone())?;
+
+        self.cell_num += 1;
+
+        if self.cell_num >= node.num_cells() as usize {
             self.end_of_table = true
         }
+
+        Ok(())
     }
 }
