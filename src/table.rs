@@ -2,7 +2,7 @@ use anyhow::{anyhow, bail, Context};
 use std::{cell::RefCell, fmt::Debug, path::Path, rc::Rc, str::from_utf8};
 
 use crate::{
-    constants::{EMAIL_OFFSET, ID_OFFSET, LEAF_NODE_MAX_CELLS, ROWS_SIZE, USERNAME_OFFSET},
+    constants::{EMAIL_OFFSET, ID_OFFSET, ROWS_SIZE, USERNAME_OFFSET},
     cursor::Cursor,
     node::{Node, NodeType},
     pager::Pager,
@@ -137,7 +137,7 @@ impl Row {
 
 #[derive(Debug)]
 pub struct Table {
-    pub root_page_num: usize,
+    pub root_page_num: u32,
     pub pager: Rc<RefCell<Pager>>,
 }
 
@@ -176,12 +176,7 @@ impl Table {
         let node =
             Node::try_from(page.borrow().clone()).context("could not create Node from Page")?;
 
-        let num_cells = node.num_cells() as usize;
-
-        if num_cells >= LEAF_NODE_MAX_CELLS {
-            bail!("max cells in root leaf node")
-        }
-
+        let num_cells = node.num_cells() as u32;
         let key_to_insert = r.id;
 
         let cursor = self.cursor_find(key_to_insert)?;
@@ -203,11 +198,11 @@ impl Table {
         let mut cursor = self.cursor_start()?;
 
         while !cursor.end_of_table {
-            let row_bytes = cursor.cursor_value()?;
-            let row = Row::deserialize(&row_bytes)?;
-            rows.push(row);
-
-            cursor.advance()?;
+            if let Some(row_bytes) = cursor.cursor_value()? {
+                let row = Row::deserialize(&row_bytes)?;
+                rows.push(row);
+            }
+            cursor.advance()?
         }
         Ok(rows)
     }
@@ -241,14 +236,18 @@ impl Table {
 
         let root_node = Node::try_from(root_page.borrow().clone())?;
 
-        if let NodeType::Internal(_, _) = root_node.node_type {
+        if let NodeType::Internal {
+            right_child: _,
+            child_pointer_pairs: _,
+        } = root_node.node_type
+        {
             todo!()
         } else {
             self.leaf_node_find(root_page_num, key_to_insert)
         }
     }
 
-    fn leaf_node_find(&mut self, page_num: usize, key: u32) -> anyhow::Result<Cursor> {
+    fn leaf_node_find(&mut self, page_num: u32, key: u32) -> anyhow::Result<Cursor> {
         let node = Node::try_from(self.pager.borrow_mut().get_page(page_num)?.borrow().clone())?;
 
         let mut cursor = Cursor::new(self.pager.clone(), page_num, 0, false);
@@ -257,7 +256,7 @@ impl Table {
             let inx = kvs
                 .binary_search_by_key(&key, |(k, _)| *k)
                 .unwrap_or_else(|x| x);
-            cursor.cell_num = inx;
+            cursor.cell_num = inx as u32;
         } else {
             bail!("invalid type!")
         }
@@ -265,19 +264,34 @@ impl Table {
         Ok(cursor)
     }
 
-    // pub fn cursor_end(&mut self) -> anyhow::Result<Cursor> {
-    //     let page_num = self.root_page_num;
+    fn print(&self, page_num: u32) -> anyhow::Result<()> {
+        let node = Node::try_from(self.pager.borrow_mut().get_page(page_num)?)?;
 
-    //     let root = &self.pager.borrow_mut().get_page(self.root_page_num)?;
-    //     let node = Node::try_from(root.borrow().clone())?;
+        match node.node_type {
+            NodeType::Internal {
+                right_child,
+                child_pointer_pairs,
+            } => {
+                println!(
+                    "internal (size {}, key {:?})",
+                    child_pointer_pairs.len(),
+                    right_child
+                );
+                for (pointer, _) in child_pointer_pairs {
+                    self.print(pointer.0)?;
+                }
+                self.print(right_child.0)?;
+            }
+            NodeType::Leaf(values) => {
+                println!(
+                    "leaf: {:?}",
+                    values.iter().map(|(key, _)| *key).collect::<Vec<u32>>()
+                )
+            }
+        }
 
-    //     Ok(Cursor::new(
-    //         self.pager.clone(),
-    //         page_num,
-    //         node.num_cells().try_into()?,
-    //         true,
-    //     ))
-    // }
+        Ok(())
+    }
 }
 
 pub fn vector_to_array<T, const N: usize>(mut v: Vec<T>) -> anyhow::Result<[T; N]>
@@ -418,40 +432,32 @@ mod tests {
         Ok(())
     }
 
-    // #[test]
-    // fn test_table_multiple_inserts() -> anyhow::Result<()> {
-    //     let mut rows = vec![];
-    //     for i in 0..1000 {
-    //         rows.push(Row {
-    //             id: i,
-    //             username: vector_to_array(str_as_bytes("a".repeat(i as usize % 32).as_str()))
-    //                 .unwrap(),
-    //             email: vector_to_array(str_as_bytes("b".repeat(i as usize % 255).as_str()))
-    //                 .unwrap(),
-    //         })
-    //     }
+    #[test]
+    fn test_table_multiple_inserts() -> anyhow::Result<()> {
+        let mut rows = vec![];
+        for i in 0..14 {
+            rows.push(Row {
+                id: i,
+                username: vector_to_array(str_as_bytes("a".repeat(i as usize % 32).as_str()))
+                    .unwrap(),
+                email: vector_to_array(str_as_bytes("b".repeat(i as usize % 255).as_str()))
+                    .unwrap(),
+            })
+        }
 
-    //     let tmp_dir = TempDir::new("databurst")?;
-    //     let file_path = tmp_dir.path().join("my.db");
-    //     File::create(&file_path)?;
+        let tmp_dir = TempDir::new("databurst")?;
+        let file_path = tmp_dir.path().join("my.db");
+        File::create(&file_path)?;
 
-    //     let mut db = Table::db_open(&file_path)?;
+        let mut db = Table::db_open(&file_path)?;
 
-    //     for row in &rows {
-    //         db.insert(row)?;
-    //     }
+        for row in &rows {
+            db.insert(row)?;
+        }
 
-    //     let mut got = db.collect()?;
-    //     got.sort_by_key(|r| r.id);
-    //     assert_eq!(rows, got);
+        db.print(db.root_page_num)?;
+        db.close()?;
 
-    //     db.close()?;
-    //     let mut db = Table::db_open(&file_path)?;
-
-    //     let mut got = db.collect()?;
-    //     got.sort_by_key(|r| r.id);
-    //     assert_eq!(rows, got);
-
-    //     Ok(())
-    // }
+        Ok(())
+    }
 }
