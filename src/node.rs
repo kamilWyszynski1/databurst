@@ -1,3 +1,5 @@
+use std::{cell::RefCell, rc::Rc};
+
 use crate::{
     constants::{
         IS_ROOT_OFFSET, LEAF_NODE_HEADER_SIZE, LEAF_NODE_KEY_SIZE, LEAF_NODE_NUM_CELLS_OFFSET,
@@ -117,6 +119,14 @@ impl TryFrom<Page> for Node {
                 Ok(Self::new(NodeType::Leaf(pairs), is_root, parent))
             }
         }
+    }
+}
+
+impl TryFrom<Rc<RefCell<Page>>> for Node {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Rc<RefCell<Page>>) -> anyhow::Result<Self, Self::Error> {
+        Node::try_from(value.borrow().clone())
     }
 }
 

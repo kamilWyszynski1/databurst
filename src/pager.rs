@@ -27,7 +27,7 @@ impl Page {
         self.data.to_vec()
     }
 
-    /// get_ptr_from_offset fetches a slice of bytes from certain offset and of certain size.
+    /// Fetches a slice of bytes from certain offset and of certain size.
     pub fn get_ptr_from_offset(&self, offset: usize, size: usize) -> &[u8] {
         &self.data[offset..offset + size]
     }
@@ -60,6 +60,12 @@ impl Pager {
             num_pages,
             pages_rc: [INIT; TABLE_MAX_PAGES],
         })
+    }
+
+    /// Until we start recycling free pages, new pages will always go onto the end of the database file.
+    /// TODO: reuse already alocated(written) pages after deletion
+    pub fn get_unused_page_num(&self) -> usize {
+        self.num_pages
     }
 
     pub fn get_page(&mut self, page_num: usize) -> anyhow::Result<Rc<RefCell<Page>>> {
