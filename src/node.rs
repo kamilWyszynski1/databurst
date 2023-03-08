@@ -92,6 +92,19 @@ impl Node {
         }
     }
 
+    pub fn is_leaf_node(&self) -> bool {
+        match self.node_type {
+            NodeType::Internal {
+                right_child: _,
+                child_pointer_pairs: _,
+            } => false,
+            NodeType::Leaf {
+                kvs: _,
+                next_leaf: _,
+            } => true,
+        }
+    }
+
     pub fn leaf_node_value(&self, cell_num: u32) -> anyhow::Result<Option<Vec<u8>>> {
         match self.node_type {
             NodeType::Internal {

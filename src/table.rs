@@ -247,7 +247,7 @@ impl Table {
                 Ok(inx) => self.cursor_find(
                     child_pointer_pairs
                         .get(inx)
-                        .context("coult not get value by index after binary search")?
+                        .context("could not get value by index after binary search")?
                         .0
                          .0,
                     key,
@@ -265,7 +265,7 @@ impl Table {
     }
 
     #[cfg(test)]
-    fn print(&self, page_num: u32) -> anyhow::Result<()> {
+    fn dfs(&self, page_num: u32) -> anyhow::Result<()> {
         let node = Node::try_from(self.pager.borrow_mut().get_page(page_num)?)?;
 
         match node.node_type {
@@ -277,6 +277,35 @@ impl Table {
                     "internal (size {}, key {:?})",
                     child_pointer_pairs.len(),
                     right_child
+                );
+                for (pointer, _) in child_pointer_pairs {
+                    self.print(pointer.0)?;
+                }
+                self.print(right_child.0)?;
+            }
+            NodeType::Leaf { kvs, next_leaf: _ } => {
+                println!(
+                    "leaf: {:?}",
+                    kvs.iter().map(|(key, _)| key.0).collect::<Vec<u32>>()
+                )
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn print(&self, page_num: u32) -> anyhow::Result<()> {
+        let node = Node::try_from(self.pager.borrow_mut().get_page(page_num)?)?;
+
+        match node.node_type {
+            NodeType::Internal {
+                right_child,
+                child_pointer_pairs,
+            } => {
+                println!(
+                    "internal (size {:?}, key {:?})",
+                    child_pointer_pairs, right_child
                 );
                 for (pointer, _) in child_pointer_pairs {
                     self.print(pointer.0)?;
@@ -436,7 +465,7 @@ mod tests {
     #[test]
     fn test_table_multiple_inserts() -> anyhow::Result<()> {
         let mut rows = vec![];
-        for i in 1..=20 {
+        for i in 1..=40 {
             rows.push(Row {
                 id: i,
                 username: vector_to_array(str_as_bytes("a".repeat(i as usize % 32).as_str()))
@@ -457,8 +486,6 @@ mod tests {
         }
 
         db.print(db.root_page_num)?;
-
-        db.select()?;
 
         db.close()?;
 
