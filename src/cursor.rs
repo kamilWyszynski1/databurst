@@ -1,6 +1,6 @@
 use std::{cell::RefCell, rc::Rc};
 
-use anyhow::{Context, Ok};
+use anyhow::Ok;
 
 use crate::{
     constants::LEAF_NODE_MAX_CELLS,
@@ -103,11 +103,8 @@ impl Cursor {
             // split the root
             let root = Node::new(
                 NodeType::Internal {
-                    right_child: Pointer(right_page_num as u32),
-                    child_pointer_pairs: vec![(
-                        Pointer(new_left_page_num as u32),
-                        left_child_max_key,
-                    )],
+                    right_child: Pointer(right_page_num),
+                    child_pointer_pairs: vec![(Pointer(new_left_page_num), left_child_max_key)],
                 },
                 true,
                 None,
@@ -126,7 +123,7 @@ impl Cursor {
 
         self.cell_num += 1;
 
-        if self.cell_num >= node.num_cells() as u32 {
+        if self.cell_num >= node.num_cells() {
             self.end_of_table = true
         }
 
