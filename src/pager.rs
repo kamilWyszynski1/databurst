@@ -1,5 +1,6 @@
 use crate::{
     constants::{PAGE_SIZE, TABLE_MAX_PAGES},
+    node::Node,
     table::vector_to_array,
 };
 use anyhow::bail;
@@ -17,7 +18,7 @@ pub struct Page {
 }
 
 impl Page {
-    fn new() -> Self {
+    pub fn default() -> Self {
         Self {
             data: [0; PAGE_SIZE],
         }
@@ -30,6 +31,16 @@ impl Page {
     /// Fetches a slice of bytes from certain offset and of certain size.
     pub fn get_ptr_from_offset(&self, offset: usize, size: usize) -> &[u8] {
         &self.data[offset..offset + size]
+    }
+}
+
+impl TryFrom<Node> for Page {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Node) -> anyhow::Result<Self, Self::Error> {
+        Ok(Self {
+            data: value.try_into()?,
+        })
     }
 }
 
@@ -100,12 +111,12 @@ impl Pager {
             reader.take(PAGE_SIZE as u64).read_to_end(&mut buf)?;
 
             // let's split page into chunks
-            let mut page = Page::new();
+            let mut page = Page::default();
             page.data = vector_to_array(buf)?;
 
             page
         } else {
-            Page::new()
+            Page::default()
         };
 
         let p = Rc::new(RefCell::new(page));

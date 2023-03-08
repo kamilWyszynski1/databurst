@@ -79,11 +79,7 @@ impl Cursor {
             let right_page = self.pager.borrow_mut().get_page(right_page_num)?;
 
             // All existing keys plus new key should be divided evenly between old (left) and new (right) nodes.
-            if let NodeType::Leaf {
-                mut kvs,
-                next_leaf: _,
-            } = left_node.node_type
-            {
+            if let NodeType::Leaf { mut kvs, next_leaf } = left_node.node_type {
                 kvs.insert(self.cell_num as usize, (key.into(), data.to_vec()));
                 let siblings_kvs = kvs.split_off((kvs.len() + 1) / 2);
 
@@ -99,7 +95,7 @@ impl Cursor {
                 right_page.borrow_mut().data = Node::new(
                     NodeType::Leaf {
                         kvs: siblings_kvs,
-                        next_leaf: None,
+                        next_leaf,
                     },
                     false,
                     left_node.parent,
@@ -131,8 +127,6 @@ impl Cursor {
                 None,
             );
             left_page.borrow_mut().data = root.try_into()?; // rewrite root
-        } else {
-            unimplemented!()
         }
 
         Ok(())
@@ -187,6 +181,105 @@ impl Cursor {
         if self.cell_num >= node.num_cells() {
             self.end_of_table = true
         }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::{cell::RefCell, fs::File, rc::Rc};
+
+    use anyhow::Ok;
+    use tempdir::TempDir;
+
+    use crate::{
+        node::{Key, Node, NodeType, Pointer},
+        pager::{Page, Pager},
+        table::Row,
+    };
+
+    use super::Cursor;
+
+    #[test]
+    fn test_leaf_node_split_and_insert() -> anyhow::Result<()> {
+        let tmp_dir = TempDir::new("databurst")?;
+        let file_path = tmp_dir.path().join("my.db");
+        let _f = File::create(&file_path)?;
+
+        let mut pager = Pager::new(file_path)?;
+        pager.num_pages = 2;
+
+        let row_bytes =
+            Row::try_from((1, "username".to_string(), "email".to_string()))?.serialize();
+
+        let node_0 = Node::new(
+            NodeType::Leaf {
+                kvs: vec![
+                    (Key(1), row_bytes.clone()),
+                    (Key(2), row_bytes.clone()),
+                    (Key(3), row_bytes.clone()),
+                    (Key(4), row_bytes.clone()),
+                    (Key(5), row_bytes.clone()),
+                    (Key(6), row_bytes.clone()),
+                    (Key(7), row_bytes.clone()),
+                    (Key(8), row_bytes.clone()),
+                    (Key(9), row_bytes.clone()),
+                    (Key(10), row_bytes.clone()),
+                    (Key(11), row_bytes.clone()),
+                    (Key(12), row_bytes.clone()),
+                    (Key(13), row_bytes.clone()),
+                ],
+                next_leaf: Some(Pointer(1)),
+            },
+            false,
+            None,
+        );
+        let node_1 = Node::new(
+            NodeType::Leaf {
+                kvs: vec![],
+                next_leaf: None,
+            },
+            false,
+            None,
+        );
+
+        let page_0 = Rc::new(RefCell::new(Page::try_from(node_0)?));
+        let page_1 = Rc::new(RefCell::new(Page::try_from(node_1)?));
+
+        pager.pages_rc[0] = Some(page_0.clone());
+        pager.pages_rc[1] = Some(page_1);
+
+        let pager = Rc::new(RefCell::new(pager));
+        let cursor = Cursor::new(pager.clone(), 0, 0, false);
+        cursor.leaf_node_split_and_insert(15, &row_bytes)?;
+
+        let node_0 = Node::try_from(page_0)?;
+
+        let new_node = Node::try_from(pager.borrow_mut().get_page(2)?)?;
+
+        match node_0.node_type {
+            NodeType::Internal {
+                right_child: _,
+                child_pointer_pairs: _,
+            } => {
+                panic!("node cannot be internal");
+            }
+            NodeType::Leaf { kvs: _, next_leaf } => {
+                assert_eq!(next_leaf.unwrap().0, 2);
+            }
+        };
+        match new_node.node_type {
+            NodeType::Internal {
+                right_child: _,
+                child_pointer_pairs: _,
+            } => {
+                panic!("node cannot be internal");
+            }
+            NodeType::Leaf { kvs: _, next_leaf } => {
+                assert_eq!(next_leaf.unwrap().0, 1); // points to node_1, where node_0 pointed before
+            }
+        };
 
         Ok(())
     }
