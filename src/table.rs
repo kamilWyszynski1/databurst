@@ -179,7 +179,7 @@ impl Table {
         let num_cells = node.num_cells();
         let key_to_insert = r.id;
 
-        let cursor = self.cursor_find(key_to_insert)?;
+        let cursor = self.cursor_find(self.root_page_num, key_to_insert)?;
 
         if cursor.cell_num < num_cells {
             let key_at_index = node.leaf_node_key(cursor.cell_num)?;
@@ -193,22 +193,23 @@ impl Table {
         Ok(())
     }
 
-    fn collect(&mut self) -> anyhow::Result<Vec<Row>> {
-        let mut rows = vec![];
+    pub fn collect(&mut self) -> anyhow::Result<Vec<Row>> {
         let mut cursor = self.cursor_start()?;
 
-        while !cursor.end_of_table {
-            if let Some(row_bytes) = cursor.cursor_value()? {
-                let row = Row::deserialize(&row_bytes)?;
-                rows.push(row);
-            }
-            cursor.advance()?
-        }
-        Ok(rows)
+        let data = cursor.select()?;
+
+        Ok(data
+            .into_iter()
+            .map(|bytes| Row::deserialize(&bytes).unwrap())
+            .collect())
     }
 
-    pub fn select(&mut self) {
-        self.collect().into_iter().for_each(|r| println!("{:?}", r));
+    pub fn select(&mut self) -> anyhow::Result<()> {
+        self.collect()?
+            .into_iter()
+            .for_each(|r| println!("{:?}", r));
+
+        Ok(())
     }
 
     pub fn cursor_start(&mut self) -> anyhow::Result<Cursor> {
@@ -230,38 +231,37 @@ impl Table {
 
     /// Return the position of the given key.
     /// If the key is not present, return the position where it should be inserted.
-    fn cursor_find(&mut self, key_to_insert: u32) -> anyhow::Result<Cursor> {
-        let root_page_num = self.root_page_num;
-        let root_page = self.pager.borrow_mut().get_page(root_page_num)?;
+    fn cursor_find(&mut self, page_num: u32, key: u32) -> anyhow::Result<Cursor> {
+        let root_page = self.pager.borrow_mut().get_page(page_num)?;
 
         let root_node = Node::try_from(root_page.borrow().clone())?;
 
-        if let NodeType::Internal {
-            right_child: _,
-            child_pointer_pairs: _,
-        } = root_node.node_type
-        {
-            todo!()
-        } else {
-            self.leaf_node_find(root_page_num, key_to_insert)
-        }
-    }
-
-    fn leaf_node_find(&mut self, page_num: u32, key: u32) -> anyhow::Result<Cursor> {
-        let node = Node::try_from(self.pager.borrow_mut().get_page(page_num)?.borrow().clone())?;
-
+        // TODO: set page_num properly in case
         let mut cursor = Cursor::new(self.pager.clone(), page_num, 0, false);
 
-        if let NodeType::Leaf(kvs) = node.node_type {
-            let inx = kvs
-                .binary_search_by_key(&key, |(k, _)| *k)
-                .unwrap_or_else(|x| x);
-            cursor.cell_num = inx as u32;
-        } else {
-            bail!("invalid type!")
+        match root_node.node_type {
+            NodeType::Internal {
+                right_child,
+                child_pointer_pairs,
+            } => match child_pointer_pairs.binary_search_by_key(&key, |(_, k)| k.0) {
+                Ok(inx) => self.cursor_find(
+                    child_pointer_pairs
+                        .get(inx)
+                        .context("coult not get value by index after binary search")?
+                        .0
+                         .0,
+                    key,
+                ),
+                Err(_) => self.cursor_find(right_child.0, key),
+            },
+            NodeType::Leaf { kvs, next_leaf: _ } => {
+                let inx = kvs
+                    .binary_search_by_key(&key, |(k, _)| k.0)
+                    .unwrap_or_else(|x| x);
+                cursor.cell_num = inx as u32;
+                Ok(cursor)
+            }
         }
-
-        Ok(cursor)
     }
 
     #[cfg(test)]
@@ -283,10 +283,10 @@ impl Table {
                 }
                 self.print(right_child.0)?;
             }
-            NodeType::Leaf(values) => {
+            NodeType::Leaf { kvs, next_leaf: _ } => {
                 println!(
                     "leaf: {:?}",
-                    values.iter().map(|(key, _)| *key).collect::<Vec<u32>>()
+                    kvs.iter().map(|(key, _)| key.0).collect::<Vec<u32>>()
                 )
             }
         }
@@ -436,7 +436,7 @@ mod tests {
     #[test]
     fn test_table_multiple_inserts() -> anyhow::Result<()> {
         let mut rows = vec![];
-        for i in 1..=14 {
+        for i in 1..=20 {
             rows.push(Row {
                 id: i,
                 username: vector_to_array(str_as_bytes("a".repeat(i as usize % 32).as_str()))
@@ -457,6 +457,9 @@ mod tests {
         }
 
         db.print(db.root_page_num)?;
+
+        db.select()?;
+
         db.close()?;
 
         Ok(())

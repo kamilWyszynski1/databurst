@@ -10,17 +10,38 @@ use crate::{
 };
 use anyhow::{bail, Context, Ok};
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Pointer(pub u32);
+
+impl From<u32> for Pointer {
+    fn from(value: u32) -> Self {
+        Self(value)
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Key(pub u32);
+
+impl From<u32> for Key {
+    fn from(value: u32) -> Self {
+        Self(value)
+    }
+}
 
 pub enum NodeType {
     /// Internal nodes contain a vector of pointers to their children and a vector of keys.
     Internal {
         right_child: Pointer,
-        child_pointer_pairs: Vec<(Pointer, u32)>,
+        child_pointer_pairs: Vec<(Pointer, Key)>,
     },
 
-    Leaf(Vec<(u32, Vec<u8>)>),
+    Leaf {
+        /// Key - Value vector of serialized data. Key is Row's ID field value.
+        kvs: Vec<(Key, Vec<u8>)>,
+
+        /// Optional pointer to right next leaf. Enables robust select;
+        next_leaf: Option<Pointer>,
+    },
 }
 
 impl TryFrom<u8> for NodeType {
@@ -28,7 +49,10 @@ impl TryFrom<u8> for NodeType {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         Ok(match value {
-            0x00 => NodeType::Leaf(vec![]),
+            0x00 => NodeType::Leaf {
+                kvs: vec![],
+                next_leaf: None,
+            },
             0x01 => Self::Internal {
                 right_child: Pointer(0),
                 child_pointer_pairs: Vec::new(),
@@ -41,7 +65,10 @@ impl TryFrom<u8> for NodeType {
 impl From<&NodeType> for u8 {
     fn from(val: &NodeType) -> Self {
         match val {
-            NodeType::Leaf(_) => 0x00,
+            NodeType::Leaf {
+                kvs: _,
+                next_leaf: _,
+            } => 0x00,
             NodeType::Internal {
                 right_child: _,
                 child_pointer_pairs: _,
@@ -71,9 +98,11 @@ impl Node {
                 right_child: _,
                 child_pointer_pairs: _,
             } => Ok(None),
-            NodeType::Leaf(ref values) => Ok(Some(
-                values
-                    .get(cell_num as usize)
+            NodeType::Leaf {
+                ref kvs,
+                next_leaf: _,
+            } => Ok(Some(
+                kvs.get(cell_num as usize)
                     .context("could not get value by cell_num")?
                     .clone()
                     .1,
@@ -87,11 +116,15 @@ impl Node {
                 right_child: _,
                 child_pointer_pairs: _,
             } => bail!("leaf_node_key called for Internal"),
-            NodeType::Leaf(ref values) => Ok(values
+            NodeType::Leaf {
+                ref kvs,
+                next_leaf: _,
+            } => Ok(kvs
                 .get(cell_num as usize)
                 .context("could not get value by cell_num")?
                 .clone()
-                .0),
+                .0
+                 .0),
         }
     }
 
@@ -101,7 +134,7 @@ impl Node {
                 right_child: _,
                 child_pointer_pairs,
             } => child_pointer_pairs.len() as u32,
-            NodeType::Leaf(values) => values.len() as u32,
+            NodeType::Leaf { kvs, next_leaf: _ } => kvs.len() as u32,
         }
     }
 
@@ -110,16 +143,17 @@ impl Node {
             NodeType::Internal {
                 right_child: _,
                 child_pointer_pairs,
-            } => child_pointer_pairs
-                .iter()
-                .map(|(_, key)| *key)
-                .last()
-                .unwrap_or_default(),
-            NodeType::Leaf(values) => values
-                .iter()
-                .map(|(key, _)| *key)
-                .last()
-                .unwrap_or_default(),
+            } => {
+                child_pointer_pairs
+                    .iter()
+                    .map(|(_, key)| *key)
+                    .last()
+                    .unwrap_or_default()
+                    .0
+            }
+            NodeType::Leaf { kvs, next_leaf: _ } => {
+                kvs.iter().map(|(key, _)| *key).last().unwrap_or_default().0
+            }
         }
     }
 }
@@ -164,7 +198,7 @@ impl TryFrom<Page> for Node {
                     let key = pointer_from_bytes(&data, offset).context("could not parse key")?;
                     offset += LEAF_NODE_KEY_SIZE;
 
-                    child_pointer_pairs.push((pointer, key));
+                    child_pointer_pairs.push((pointer, Key(key)));
                 }
 
                 Ok(Self::new(
@@ -176,16 +210,30 @@ impl TryFrom<Page> for Node {
                     parent,
                 ))
             }
-            NodeType::Leaf(mut pairs) => {
+            NodeType::Leaf {
+                mut kvs,
+                mut next_leaf,
+            } => {
+                next_leaf =
+                    match pointer_from_bytes(&data, offset).context("could not parse next_leaf")? {
+                        0 => None,
+                        value => Some(Pointer(value)),
+                    };
+
+                offset += LEAF_NODE_KEY_SIZE;
                 for _ in 0..num_cells {
                     let key = pointer_from_bytes(&data, offset).context("could not parse key")?;
                     offset += LEAF_NODE_KEY_SIZE;
                     let data = value.get_ptr_from_offset(offset, ROWS_SIZE);
                     offset += ROWS_SIZE;
-                    pairs.push((key, data.to_vec()));
+                    kvs.push((Key(key), data.to_vec()));
                 }
 
-                Ok(Self::new(NodeType::Leaf(pairs), is_root, parent))
+                Ok(Self::new(
+                    NodeType::Leaf { kvs, next_leaf },
+                    is_root,
+                    parent,
+                ))
             }
         }
     }
@@ -228,13 +276,16 @@ impl TryFrom<Node> for [u8; PAGE_SIZE] {
                     buf[offset..offset + LEAF_NODE_KEY_SIZE]
                         .copy_from_slice(&pointer.0.to_be_bytes());
                     offset += LEAF_NODE_KEY_SIZE;
-                    buf[offset..offset + LEAF_NODE_KEY_SIZE].copy_from_slice(&key.to_be_bytes());
+                    buf[offset..offset + LEAF_NODE_KEY_SIZE].copy_from_slice(&key.0.to_be_bytes());
                     offset += LEAF_NODE_KEY_SIZE;
                 }
             }
-            NodeType::Leaf(kvs) => {
+            NodeType::Leaf { kvs, next_leaf } => {
+                buf[offset..offset + LEAF_NODE_KEY_SIZE]
+                    .copy_from_slice(&next_leaf.unwrap_or_default().0.to_be_bytes());
+                offset += LEAF_NODE_KEY_SIZE;
                 for (k, v) in kvs {
-                    buf[offset..offset + LEAF_NODE_KEY_SIZE].copy_from_slice(&k.to_be_bytes());
+                    buf[offset..offset + LEAF_NODE_KEY_SIZE].copy_from_slice(&k.0.to_be_bytes());
                     offset += LEAF_NODE_KEY_SIZE;
                     buf[offset..offset + ROWS_SIZE].copy_from_slice(&v);
                     offset += ROWS_SIZE;
