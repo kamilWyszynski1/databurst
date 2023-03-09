@@ -1,4 +1,4 @@
-use std::{cell::RefCell, rc::Rc};
+use std::{any, cell::RefCell, rc::Rc};
 
 use crate::{
     constants::{
@@ -6,7 +6,7 @@ use crate::{
         LEAF_NODE_NUM_CELLS_SIZE, NODE_TYPE_OFFSET, PAGE_SIZE, PARENT_POINTER_OFFSET,
         PARENT_POINTER_SIZE, ROWS_SIZE,
     },
-    pager::Page,
+    pager::{Page, Pager},
 };
 use anyhow::{bail, Context, Ok};
 
@@ -28,6 +28,7 @@ impl From<u32> for Key {
     }
 }
 
+#[derive(Debug, Clone)]
 pub enum NodeType {
     /// Internal nodes contain a vector of pointers to their children and a vector of keys.
     Internal {
@@ -77,6 +78,7 @@ impl From<&NodeType> for u8 {
     }
 }
 
+#[derive(Debug)]
 pub struct Node {
     pub node_type: NodeType,
     pub is_root: bool,
@@ -123,21 +125,22 @@ impl Node {
         }
     }
 
-    pub fn leaf_node_key(&self, cell_num: u32) -> anyhow::Result<u32> {
+    pub fn leaf_node_key(&self, cell_num: u32) -> anyhow::Result<Option<u32>> {
         match self.node_type {
             NodeType::Internal {
                 right_child: _,
                 child_pointer_pairs: _,
-            } => bail!("leaf_node_key called for Internal"),
+            } => Ok(None),
             NodeType::Leaf {
                 ref kvs,
                 next_leaf: _,
-            } => Ok(kvs
-                .get(cell_num as usize)
-                .context("could not get value by cell_num")?
-                .clone()
-                .0
-                 .0),
+            } => Ok(Some(
+                kvs.get(cell_num as usize)
+                    .context("could not get value by cell_num")?
+                    .clone()
+                    .0
+                     .0,
+            )),
         }
     }
 
@@ -167,6 +170,91 @@ impl Node {
             NodeType::Leaf { kvs, next_leaf: _ } => {
                 kvs.iter().map(|(key, _)| *key).last().unwrap_or_default().0
             }
+        }
+    }
+
+    pub fn internal_right_pointer(&self) -> anyhow::Result<Pointer> {
+        match &self.node_type {
+            NodeType::Internal {
+                right_child,
+                child_pointer_pairs: _,
+            } => Ok(*right_child),
+            NodeType::Leaf {
+                kvs: _,
+                next_leaf: _,
+            } => {
+                bail!("internal_right_pointer called on Leaf node")
+            }
+        }
+    }
+
+    pub fn pop(&mut self) {
+        match &mut self.node_type {
+            NodeType::Internal {
+                right_child: _,
+                child_pointer_pairs,
+            } => {
+                child_pointer_pairs.pop();
+            }
+            NodeType::Leaf { kvs, next_leaf: _ } => {
+                kvs.pop();
+            }
+        }
+    }
+
+    fn is_internal(&self) -> bool {
+        match self.node_type {
+            NodeType::Internal {
+                right_child: _,
+                child_pointer_pairs: _,
+            } => true,
+            NodeType::Leaf {
+                kvs: _,
+                next_leaf: _,
+            } => false,
+        }
+    }
+
+    /// Can be run only on internal page, it checks if 'right_pointer' and max from 'child_pointer_pairs' are the same,
+    /// if so, value is deleted from  'child_pointer_pairs'.
+    /// Returns 'true' when there was overriding pointers.
+    pub fn remove_overriding_pointers(
+        &mut self,
+        pager: Rc<RefCell<Pager>>,
+    ) -> anyhow::Result<bool> {
+        if !self.is_internal() {
+            bail!("remove_overriding_pointers called on Leaf node")
+        }
+        let right_pointer_key = Node::try_from(
+            pager
+                .borrow_mut()
+                .get_page(self.internal_right_pointer()?.0)?,
+        )?
+        .max_key();
+        if self.max_key() == right_pointer_key {
+            self.pop();
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Returns internal's node children. Returns error when node's a Leaf.
+    pub fn children_pointers(&self) -> anyhow::Result<Vec<Pointer>> {
+        match &self.node_type {
+            NodeType::Internal {
+                right_child,
+                child_pointer_pairs,
+            } => {
+                let mut pointers: Vec<Pointer> =
+                    child_pointer_pairs.iter().map(|(p, _)| *p).collect();
+                pointers.push(*right_child);
+
+                Ok(pointers)
+            }
+            NodeType::Leaf {
+                kvs: _,
+                next_leaf: _,
+            } => bail!("children_pointers called on Leaf node"),
         }
     }
 }
