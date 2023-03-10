@@ -150,17 +150,7 @@ impl Cursor {
             } => {
                 let pointers_len = child_pointer_pairs.len();
                 if pointers_len == LEAF_NODE_MAX_CELLS {
-                    println!("{key} internal split");
                     // find place to insert key
-                    if key
-                        >= child_pointer_pairs
-                            .last()
-                            .context("there's no last item")?
-                            .1
-                             .0
-                    {
-                        right_child = Pointer(right_child_num);
-                    }
                     let inx = child_pointer_pairs
                         .binary_search_by_key(&key, |(_, Key(key))| *key)
                         .unwrap_or_else(|x| x);
@@ -168,6 +158,7 @@ impl Cursor {
 
                     // split
                     let siblings = child_pointer_pairs.split_off((pointers_len + 1) / 2);
+                    // find max pointer-key pair in left child
                     let (max_pointer, max_left) = child_pointer_pairs
                         .clone()
                         .into_iter()
@@ -178,13 +169,6 @@ impl Cursor {
                     let new_page = self.pager.borrow_mut().get_page(new_page_num)?;
                     // create and update new node
                     {
-                        println!(
-                            "new right: {:?}",
-                            siblings
-                                .iter()
-                                .map(|(_, Key(key))| *key)
-                                .collect::<Vec<u32>>(),
-                        );
                         let new_node = Node::new(
                             NodeType::Internal {
                                 right_child,
@@ -265,27 +249,12 @@ impl Cursor {
                             None,
                         );
                         page.borrow_mut().data = root.try_into()?;
-
-                        // // update new root's left child
-                        // let mut new_root_left_child_node =
-                        //     Node::try_from(new_root_left_child_page.clone())?;
-                        // new_root_left_child_node.parent = Some(0);
-
-                        // new_root_left_child_page.borrow_mut().data =
-                        //     new_root_left_child_node.try_into()?;
-
-                        // // update new root's right child
-                        // let mut root_right_child = Node::try_from(new_page.clone())?;
-                        // root_right_child.parent = Some(0);
-                        // new_page.borrow_mut().data = root_right_child.try_into()?;
                     } else {
                         // update parent
-                        self.insert_into_internal(
-                            node.parent
-                                .context("internal node which is not root without parent")?,
-                            new_page_num,
-                            max_left.0,
-                        )?;
+                        let parent = node
+                            .parent
+                            .context("internal node which is not root without parent")?;
+                        self.insert_into_internal(parent, new_page_num, max_left.0)?;
                     }
                 } else {
                     if key
@@ -295,17 +264,17 @@ impl Cursor {
                             .1
                              .0
                     {
-                        println!("right child update: {right_child_num}");
-                        // let right_child_key =
-                        //     Node::try_from(self.pager.borrow_mut().get_page(right_child.0)?)?
-                        //         .max_key();
-                        // child_pointer_pairs.push((right_child, Key(right_child_key)));
+                        let right_child_key =
+                            Node::try_from(self.pager.borrow_mut().get_page(right_child.0)?)?
+                                .max_key();
+                        child_pointer_pairs.push((right_child, Key(right_child_key)));
                         right_child = Pointer(right_child_num);
+                    } else {
+                        let inx = child_pointer_pairs
+                            .binary_search_by_key(&key, |(_, Key(key))| *key)
+                            .unwrap_or_else(|x| x);
+                        child_pointer_pairs.insert(inx, (Pointer(self.page_num), Key(key)));
                     }
-                    let inx = child_pointer_pairs
-                        .binary_search_by_key(&key, |(_, Key(key))| *key)
-                        .unwrap_or_else(|x| x);
-                    child_pointer_pairs.insert(inx, (Pointer(self.page_num), Key(key)));
 
                     // update node
                     page.borrow_mut().data = Node::new(
