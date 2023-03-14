@@ -24,7 +24,7 @@ pub fn input_loop(mut table: Table) -> anyhow::Result<()> {
                 if let Some(query) = parse_query(input)? {
                     match query {
                         Query::Select => {
-                            table.select();
+                            table.select()?;
                         }
                         Query::Insert(id, username, email) => {
                             table.insert(&Row::try_from((id, username, email))?)?;
