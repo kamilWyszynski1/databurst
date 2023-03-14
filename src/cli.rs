@@ -14,7 +14,7 @@ fn report(err: anyhow::Error) {
     }
 }
 
-pub fn input_loop(mut table: Table) -> anyhow::Result<()> {
+pub fn input_loop(mut table: Table<u32, Row>) -> anyhow::Result<()> {
     loop {
         print!("lipsy>: ");
 
@@ -27,7 +27,7 @@ pub fn input_loop(mut table: Table) -> anyhow::Result<()> {
                             table.select()?;
                         }
                         Query::Insert(id, username, email) => {
-                            table.insert(&Row::try_from((id, username, email))?)?;
+                            table.insert(id, Row::try_from((id, username, email))?)?;
                         }
                         Query::Exit => break,
                     }

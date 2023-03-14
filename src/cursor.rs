@@ -317,12 +317,8 @@ impl Cursor {
 
         Ok(())
     }
-}
 
-impl TryInto<Option<Row>> for Cursor {
-    type Error = anyhow::Error;
-
-    fn try_into(self) -> anyhow::Result<Option<Row>, Self::Error> {
+    pub fn data(&self) -> anyhow::Result<Option<Vec<u8>>> {
         let page = self.pager.borrow_mut().get_page(self.page_num)?;
         let node = Node::try_from(page)?;
         match node.node_type {
@@ -339,7 +335,7 @@ impl TryInto<Option<Row>> for Cursor {
                 let (_, data) = kvs.get(self.cell_num as usize).with_context(|| {
                     format!("could not get {} kv from Leaf Node", self.cell_num)
                 })?;
-                return Ok(Some(Row::deserialize(&data)?));
+                return Ok(Some(data.clone()));
             }
         }
     }
@@ -355,7 +351,7 @@ mod test {
     use crate::{
         node::{Key, Node, NodeType, Pointer},
         pager::{Page, Pager},
-        table::Row,
+        table::{Row, Serialize},
     };
 
     use super::Cursor;

@@ -1,5 +1,8 @@
 use anyhow::{anyhow, bail, Context};
-use std::{cell::RefCell, fmt::Debug, path::Path, rc::Rc, str::from_utf8};
+use std::{
+    cell::RefCell, collections::HashMap, fmt::Debug, marker::PhantomData, path::Path, rc::Rc,
+    str::from_utf8,
+};
 
 use crate::{
     constants::{EMAIL_OFFSET, ID_OFFSET, ROWS_SIZE, USERNAME_OFFSET},
@@ -27,6 +30,14 @@ macro_rules! field_size {
 pub const ID_SIZE: usize = field_size!(Row::id);
 pub const USERNAME_SIZE: usize = field_size!(Row::username);
 pub const EMAIL_SIZE: usize = field_size!(Row::email);
+
+pub trait Serialize {
+    fn serialize(&self) -> Vec<u8>;
+}
+
+pub trait Deserialize: Sized {
+    fn deserialize(data: &[u8]) -> anyhow::Result<Self>;
+}
 
 #[derive(PartialOrd, Clone)]
 pub struct Row {
@@ -96,8 +107,8 @@ impl Debug for Row {
     }
 }
 
-impl Row {
-    pub fn serialize(&self) -> Vec<u8> {
+impl Serialize for Row {
+    fn serialize(&self) -> Vec<u8> {
         let mut buffer = vec![];
         buffer.append(&mut self.id.to_be_bytes().to_vec());
         buffer.append(&mut self.username.to_vec());
@@ -107,8 +118,10 @@ impl Row {
 
         buffer
     }
+}
 
-    pub fn deserialize(data: &[u8]) -> anyhow::Result<Row> {
+impl Deserialize for Row {
+    fn deserialize(data: &[u8]) -> anyhow::Result<Row> {
         if data.len() < ROWS_SIZE {
             bail!("data size is too small")
         }
@@ -136,12 +149,14 @@ impl Row {
 }
 
 #[derive(Debug)]
-pub struct Table {
+pub struct Table<K, V> {
     pub root_page_num: u32,
     pub pager: Rc<RefCell<Pager>>,
+
+    marker: PhantomData<(K, V)>,
 }
 
-impl Table {
+impl<K, V> Table<K, V> {
     pub fn db_open<P: AsRef<Path>>(p: P) -> anyhow::Result<Self> {
         let mut pager = Pager::new(p)?;
 
@@ -157,68 +172,13 @@ impl Table {
         Ok(Self {
             root_page_num: 0,
             pager: Rc::new(RefCell::new(pager)),
+            marker: PhantomData,
         })
     }
 
     /// Consumes Table and saves all content to file.
     pub fn close(self) -> anyhow::Result<()> {
         Rc::try_unwrap(self.pager).unwrap().into_inner().flush()
-    }
-
-    /// Inserts new row.
-    pub fn insert(&mut self, r: &Row) -> anyhow::Result<()> {
-        let data = r.serialize();
-
-        let page = self
-            .pager
-            .borrow_mut()
-            .get_page(self.root_page_num)
-            .with_context(|| format!("could not read {} page", self.root_page_num))?;
-        let node =
-            Node::try_from(page.borrow().clone()).context("could not create Node from Page")?;
-
-        let num_cells = node.num_cells();
-        let key_to_insert = r.id;
-
-        let cursor = self.cursor_find(self.root_page_num, key_to_insert)?;
-
-        if cursor.cell_num < num_cells {
-            if let Some(key_at_index) = node.leaf_node_key(cursor.cell_num)? {
-                if key_at_index == key_to_insert {
-                    bail!("duplicate key!")
-                }
-            }
-        }
-
-        cursor.insert(r.id, &data)?;
-
-        Ok(())
-    }
-
-    /// Searches for particular saved row.
-    pub fn search(&mut self, id: u32) -> anyhow::Result<Option<Row>> {
-        let cursor = self.cursor_find(self.root_page_num, id)?;
-
-        Ok(cursor.try_into()?)
-    }
-
-    pub fn collect(&mut self) -> anyhow::Result<Vec<Row>> {
-        let mut cursor = self.cursor_start()?;
-
-        let data = cursor.select()?;
-
-        Ok(data
-            .into_iter()
-            .map(|bytes| Row::deserialize(&bytes).unwrap())
-            .collect())
-    }
-
-    pub fn select(&mut self) -> anyhow::Result<()> {
-        self.collect()?
-            .into_iter()
-            .for_each(|r| println!("{:?}", r));
-
-        Ok(())
     }
 
     pub fn cursor_start(&mut self) -> anyhow::Result<Cursor> {
@@ -276,6 +236,44 @@ impl Table {
             }
         }
     }
+}
+
+impl<K, V> Table<K, V>
+where
+    V: Deserialize + Debug,
+{
+    pub fn select(&mut self) -> anyhow::Result<()> {
+        self.collect()?
+            .into_iter()
+            .for_each(|r| println!("{:?}", r));
+
+        Ok(())
+    }
+}
+
+impl<K, V> Table<K, V>
+where
+    V: Deserialize,
+{
+    /// Searches for particular saved row.
+    pub fn search(&mut self, id: u32) -> anyhow::Result<Option<V>> {
+        let cursor = self.cursor_find(self.root_page_num, id)?;
+        Ok(match cursor.data()? {
+            Some(data) => Some(V::deserialize(&data)?),
+            None => None,
+        })
+    }
+
+    pub fn collect(&mut self) -> anyhow::Result<Vec<V>> {
+        let mut cursor = self.cursor_start()?;
+
+        let data = cursor.select()?;
+
+        Ok(data
+            .into_iter()
+            .map(|bytes| V::deserialize(&bytes).unwrap())
+            .collect())
+    }
 
     #[cfg(test)]
     fn print(&self, page_num: u32, ident: String) -> anyhow::Result<()> {
@@ -312,6 +310,38 @@ impl Table {
                 )
             }
         }
+        Ok(())
+    }
+}
+
+impl<K, V> Table<K, V>
+where
+    V: Serialize,
+{
+    /// Inserts new row.
+    pub fn insert(&mut self, key: u32, value: V) -> anyhow::Result<()> {
+        let data = value.serialize();
+
+        let page = self
+            .pager
+            .borrow_mut()
+            .get_page(self.root_page_num)
+            .with_context(|| format!("could not read {} page", self.root_page_num))?;
+        let node =
+            Node::try_from(page.borrow().clone()).context("could not create Node from Page")?;
+
+        let num_cells = node.num_cells();
+        let cursor = self.cursor_find(self.root_page_num, key)?;
+
+        if cursor.cell_num < num_cells {
+            if let Some(key_at_index) = node.leaf_node_key(cursor.cell_num)? {
+                if key_at_index == key {
+                    bail!("duplicate key!")
+                }
+            }
+        }
+
+        cursor.insert(key, &data)?;
 
         Ok(())
     }
@@ -341,8 +371,8 @@ mod tests {
     use tempdir::TempDir;
 
     use super::{vector_to_array, Row, Table};
-    use crate::table::ROWS_SIZE;
-    use std::{fs::File, io::Write};
+    use crate::table::{Deserialize, Serialize, ROWS_SIZE};
+    use std::{collections::HashMap, fs::File, io::Write};
 
     pub fn str_as_bytes(s: &str) -> Vec<u8> {
         let mut buffer = vec![];
@@ -410,19 +440,19 @@ mod tests {
         let file_path = tmp_dir.path().join("my.db");
         File::create(&file_path)?;
 
-        let mut db = Table::db_open(&file_path)?;
+        let mut db: Table<u32, Row> = Table::db_open(&file_path)?;
 
         let wanted = vec![r1.clone(), r2.clone(), r3.clone()];
 
-        db.insert(&r1).context("could not insert r1")?;
-        db.insert(&r3)?;
-        db.insert(&r2)?;
+        db.insert(1, r1).context("could not insert r1")?;
+        db.insert(3, r3)?;
+        db.insert(2, r2)?;
 
         let got = db.collect()?;
         assert_eq!(wanted, got);
 
         db.close()?;
-        let mut db = Table::db_open(&file_path)?;
+        let mut db: Table<u32, Row> = Table::db_open(&file_path)?;
 
         let got = db.collect()?;
         assert_eq!(wanted, got);
@@ -442,12 +472,12 @@ mod tests {
         let file_path = tmp_dir.path().join("my.db");
         File::create(&file_path)?;
 
-        let mut db = Table::db_open(&file_path)?;
+        let mut db: Table<u32, Row> = Table::db_open(&file_path)?;
 
-        db.insert(&r1)?;
+        db.insert(1, r1.clone())?;
 
         assert!(db
-            .insert(&r1)
+            .insert(1, r1)
             .unwrap_err()
             .to_string()
             .contains("duplicate key!"));
@@ -472,10 +502,10 @@ mod tests {
         let file_path = tmp_dir.path().join("my.db");
         File::create(&file_path)?;
 
-        let mut db = Table::db_open(&file_path)?;
+        let mut db: Table<u32, Row> = Table::db_open(&file_path)?;
 
-        for row in &rows {
-            db.insert(row)?;
+        for row in rows {
+            db.insert(row.id, row)?;
         }
 
         db.print(db.root_page_num, "".to_string())?;
