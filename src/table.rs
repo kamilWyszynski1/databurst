@@ -1,13 +1,13 @@
 use anyhow::{anyhow, bail, Context};
 use std::{
-    cell::RefCell, collections::HashMap, fmt::Debug, marker::PhantomData, path::Path, rc::Rc,
+    cell::RefCell, collections::BTreeMap, fmt::Debug, marker::PhantomData, path::Path, rc::Rc,
     str::from_utf8,
 };
 
 use crate::{
     constants::{EMAIL_OFFSET, ID_OFFSET, ROWS_SIZE, USERNAME_OFFSET},
-    cursor::Cursor,
-    node::{Node, NodeType},
+    cursor::{Cursor, OperationInfo},
+    node::{Key, Node, NodeType},
     pager::Pager,
 };
 
@@ -148,10 +148,19 @@ impl Deserialize for Row {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct RowID {
+    pub page_num: u32,
+    pub cell_num: u32,
+}
+
 #[derive(Debug)]
 pub struct Table<K, V> {
     pub root_page_num: u32,
     pub pager: Rc<RefCell<Pager>>,
+
+    // simple, primary key index
+    index: BTreeMap<u32, RowID>,
 
     marker: PhantomData<(K, V)>,
 }
@@ -169,11 +178,42 @@ impl<K, V> Table<K, V> {
             root.borrow_mut().data = node.try_into()?;
         }
 
-        Ok(Self {
+        let mut table = Self {
             root_page_num: 0,
             pager: Rc::new(RefCell::new(pager)),
+            index: BTreeMap::default(),
             marker: PhantomData,
-        })
+        };
+        table.rebuild_index()?;
+
+        Ok(table)
+    }
+
+    fn rebuild_index(&mut self) -> anyhow::Result<()> {
+        let cursor = self.cursor_start()?;
+        self.index = cursor.try_into()?;
+        Ok(())
+    }
+
+    fn update_index_for_node(&mut self, page_num: u32, node: Node) -> anyhow::Result<()> {
+        match node.node_type {
+            NodeType::Internal {
+                right_child: _,
+                child_pointer_pairs: _,
+            } => bail!("could not update index for Interal node"),
+            NodeType::Leaf { kvs, next_leaf: _ } => {
+                for (cell_num, (Key(key), _)) in kvs.into_iter().enumerate() {
+                    self.index.insert(
+                        key,
+                        RowID {
+                            page_num,
+                            cell_num: cell_num as u32,
+                        },
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Consumes Table and saves all content to file.
@@ -185,17 +225,7 @@ impl<K, V> Table<K, V> {
         let page_num = self.root_page_num;
         let cell_num = 0;
 
-        let root = self.pager.borrow_mut().get_page(self.root_page_num)?;
-        let node = Node::try_from(root.borrow().clone())?;
-
-        let num_cells = node.num_cells();
-
-        Ok(Cursor::new(
-            self.pager.clone(),
-            page_num,
-            cell_num,
-            num_cells == 0,
-        ))
+        Ok(Cursor::new(self.pager.clone(), page_num, cell_num))
     }
 
     /// Return the position of the given key.
@@ -203,7 +233,7 @@ impl<K, V> Table<K, V> {
     fn cursor_find(&mut self, page_num: u32, key: u32) -> anyhow::Result<Cursor> {
         let root_page = self.pager.borrow_mut().get_page(page_num)?;
         let root_node = Node::try_from(root_page.borrow().clone())?;
-        let mut cursor = Cursor::new(self.pager.clone(), page_num, 0, false);
+        let mut cursor = Cursor::new(self.pager.clone(), page_num, 0);
 
         match root_node.node_type {
             NodeType::Internal {
@@ -257,7 +287,12 @@ where
 {
     /// Searches for particular saved row.
     pub fn search(&mut self, id: u32) -> anyhow::Result<Option<V>> {
-        let cursor = self.cursor_find(self.root_page_num, id)?;
+        let row_id = match self.index.get(&id) {
+            Some(row_id) => row_id,
+            None => return Ok(None),
+        };
+
+        let cursor = Cursor::new(self.pager.clone(), row_id.page_num, row_id.cell_num);
         Ok(match cursor.data()? {
             Some(data) => Some(V::deserialize(&data)?),
             None => None,
@@ -277,7 +312,7 @@ where
 
     #[cfg(test)]
     fn print(&self, page_num: u32, ident: String) -> anyhow::Result<()> {
-        use crate::node::{Key, Pointer};
+        use crate::node::Pointer;
 
         let node = Node::try_from(self.pager.borrow_mut().get_page(page_num)?)?;
 
@@ -341,7 +376,31 @@ where
             }
         }
 
-        cursor.insert(key, &data)?;
+        match cursor.insert(key, &data)? {
+            OperationInfo::Insert {
+                split_occured,
+                metadata,
+            } => {
+                if split_occured {
+                    let metadata = metadata.context("SplitMetadata should be filled")?;
+                    let left_node =
+                        Node::try_from(self.pager.borrow_mut().get_page(metadata.new_left)?)?;
+                    self.update_index_for_node(metadata.new_left, left_node)?;
+
+                    let right_node =
+                        Node::try_from(self.pager.borrow_mut().get_page(metadata.new_right)?)?;
+                    self.update_index_for_node(metadata.new_right, right_node)?;
+                } else {
+                    self.index.insert(
+                        key,
+                        RowID {
+                            page_num: cursor.page_num,
+                            cell_num: cursor.cell_num,
+                        },
+                    );
+                }
+            }
+        }
 
         Ok(())
     }
@@ -372,7 +431,7 @@ mod tests {
 
     use super::{vector_to_array, Row, Table};
     use crate::table::{Deserialize, Serialize, ROWS_SIZE};
-    use std::{collections::HashMap, fs::File, io::Write};
+    use std::{fs::File, io::Write};
 
     pub fn str_as_bytes(s: &str) -> Vec<u8> {
         let mut buffer = vec![];

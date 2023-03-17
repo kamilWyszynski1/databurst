@@ -1,46 +1,54 @@
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
-use anyhow::{bail, Context};
+use anyhow::{bail, Context, Ok};
 
 use crate::{
     constants::LEAF_NODE_MAX_CELLS,
     node::{Key, Node, NodeType, Pointer},
     pager::Pager,
-    table::Row,
+    table::RowID,
 };
+
+pub struct SplitMetadata {
+    pub new_left: u32,
+    pub new_right: u32,
+}
+/// Metadata about various, database operations.
+pub enum OperationInfo {
+    Insert {
+        split_occured: bool,
+        metadata: Option<SplitMetadata>,
+    },
+}
 
 #[derive(Debug)]
 pub struct Cursor {
     pager: Rc<RefCell<Pager>>,
-    pub end_of_table: bool,
-
     pub page_num: u32,
     pub cell_num: u32,
 }
 
 impl Cursor {
-    pub fn new(
-        pager: Rc<RefCell<Pager>>,
-        page_num: u32,
-        cell_num: u32,
-        end_of_table: bool,
-    ) -> Self {
+    pub fn new(pager: Rc<RefCell<Pager>>, page_num: u32, cell_num: u32) -> Self {
         Self {
             pager,
             cell_num,
             page_num,
-            end_of_table,
         }
     }
 
-    pub fn insert(&self, key: u32, data: &[u8]) -> anyhow::Result<()> {
+    pub fn insert(&self, key: u32, data: &[u8]) -> anyhow::Result<OperationInfo> {
         let page = self.pager.try_borrow_mut()?.get_page(self.page_num)?;
 
         // turn page's bytes into readable node
         let mut node = Node::try_from(page.borrow().clone())?;
 
         if node.num_cells() as usize >= LEAF_NODE_MAX_CELLS {
-            return self.leaf_node_split_and_insert(key, data);
+            let metadata = self.leaf_node_split_and_insert(key, data)?;
+            return Ok(OperationInfo::Insert {
+                split_occured: true,
+                metadata: Some(metadata),
+            });
         }
 
         // insert value
@@ -48,7 +56,7 @@ impl Cursor {
             crate::node::NodeType::Internal {
                 right_child: _,
                 child_pointer_pairs: _,
-            } => todo!(),
+            } => bail!("could not insert into Internal Node"),
             crate::node::NodeType::Leaf { kvs, next_leaf: _ } => {
                 // cell_num was set by binary search, it will be inserted in order
                 kvs.insert(self.cell_num as usize, (key.into(), data.to_vec()));
@@ -58,14 +66,22 @@ impl Cursor {
         // turn node back into bytes
         page.borrow_mut().data = node.try_into()?;
 
-        Ok(())
+        Ok(OperationInfo::Insert {
+            split_occured: false,
+            metadata: None,
+        })
     }
 
     /// Create a new node and move half the cells over.
     /// Insert the new value in one of the two nodes.
     /// Update parent or create a new parent.
-    pub fn leaf_node_split_and_insert(&self, key: u32, data: &[u8]) -> anyhow::Result<()> {
-        let left_page = self.pager.borrow_mut().get_page(self.page_num)?;
+    pub fn leaf_node_split_and_insert(
+        &self,
+        key: u32,
+        data: &[u8],
+    ) -> anyhow::Result<SplitMetadata> {
+        let mut left_page_num = self.page_num;
+        let left_page = self.pager.borrow_mut().get_page(left_page_num)?;
         let left_node = Node::try_from(left_page.clone())?;
 
         let right_page_num = self.pager.borrow().get_unused_page_num();
@@ -105,18 +121,15 @@ impl Cursor {
         if left_node.is_root {
             // root page has to stay as it was, because of that we need to allocate another page
             // copy content and change that page data
-            let new_left_page_num = self.pager.borrow().get_unused_page_num();
-            let new_left_page = self.pager.borrow_mut().get_page(new_left_page_num)?;
+            left_page_num = self.pager.borrow().get_unused_page_num();
+            let new_left_page = self.pager.borrow_mut().get_page(left_page_num)?;
             new_left_page.borrow_mut().data = left_page.borrow().data; // clone data
 
             // split the root
             let root = Node::new(
                 NodeType::Internal {
                     right_child: Pointer(right_page_num),
-                    child_pointer_pairs: vec![(
-                        Pointer(new_left_page_num),
-                        left_child_max_key.into(),
-                    )],
+                    child_pointer_pairs: vec![(Pointer(left_page_num), left_child_max_key.into())],
                 },
                 true,
                 None,
@@ -128,7 +141,10 @@ impl Cursor {
             self.insert_into_internal(page_num, right_page_num, left_child_max_key)?;
         }
 
-        Ok(())
+        Ok(SplitMetadata {
+            new_left: left_page_num,
+            new_right: right_page_num,
+        })
     }
 
     /// Takes key and ownership of some previously allocated stuff and inserts it into internal key.
@@ -280,42 +296,12 @@ impl Cursor {
 
     pub fn select(&mut self) -> anyhow::Result<Vec<Vec<u8>>> {
         let mut data = vec![];
-        self.select_all(self.page_num, &mut data)?;
+
+        select_all(self.pager.clone(), self.page_num, |_, _, _, bytes| {
+            data.push(bytes)
+        })?;
 
         Ok(data)
-    }
-
-    fn select_all(&mut self, page_num: u32, data: &mut Vec<Vec<u8>>) -> anyhow::Result<()> {
-        let page = self.pager.borrow_mut().get_page(page_num)?;
-        let node = Node::try_from(page)?;
-
-        match node.node_type {
-            NodeType::Internal {
-                right_child: _,
-                child_pointer_pairs,
-            } => {
-                // go to the lowest leaf, then we will use `next_leaf` field to traverse all leafs
-                self.select_all(
-                    child_pointer_pairs
-                        .get(0)
-                        .context("could not get first child in internal node")?
-                        .0
-                         .0,
-                    data,
-                )?;
-            }
-            NodeType::Leaf { kvs, next_leaf } => {
-                for (_, row_bytes) in kvs {
-                    data.push(row_bytes);
-                }
-
-                if let Some(Pointer(next)) = next_leaf {
-                    self.select_all(next, data)?; // go to the next leaf
-                }
-            }
-        }
-
-        Ok(())
     }
 
     pub fn data(&self) -> anyhow::Result<Option<Vec<u8>>> {
@@ -335,10 +321,64 @@ impl Cursor {
                 let (_, data) = kvs.get(self.cell_num as usize).with_context(|| {
                     format!("could not get {} kv from Leaf Node", self.cell_num)
                 })?;
-                return Ok(Some(data.clone()));
+                Ok(Some(data.clone()))
             }
         }
     }
+}
+
+impl TryInto<BTreeMap<u32, RowID>> for Cursor {
+    type Error = anyhow::Error;
+
+    fn try_into(self) -> anyhow::Result<BTreeMap<u32, RowID>, Self::Error> {
+        let mut map = BTreeMap::default();
+        select_all(
+            self.pager.clone(),
+            self.page_num,
+            |page_num, cell_num, Key(key), _| {
+                map.insert(key, RowID { page_num, cell_num });
+            },
+        )?;
+        Ok(map)
+    }
+}
+
+fn select_all<F: FnMut(u32, u32, Key, Vec<u8>)>(
+    pager: Rc<RefCell<Pager>>,
+    page_num: u32,
+    mut f: F,
+) -> anyhow::Result<()> {
+    let page = pager.borrow_mut().get_page(page_num)?;
+    let node = Node::try_from(page)?;
+
+    match node.node_type {
+        NodeType::Internal {
+            right_child: _,
+            child_pointer_pairs,
+        } => {
+            // go to the lowest leaf, then we will use `next_leaf` field to traverse all leafs
+            select_all(
+                pager,
+                child_pointer_pairs
+                    .get(0)
+                    .context("could not get first child in internal node")?
+                    .0
+                     .0,
+                f,
+            )?;
+        }
+        NodeType::Leaf { kvs, next_leaf } => {
+            for (inx, (key, row_bytes)) in kvs.into_iter().enumerate() {
+                f(page_num, inx as u32, key, row_bytes);
+            }
+
+            if let Some(Pointer(next)) = next_leaf {
+                select_all(pager, next, f)?; // go to the next leaf
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -416,7 +456,7 @@ mod test {
         pager.pages_rc[2] = Some(page_2);
 
         let pager = Rc::new(RefCell::new(pager));
-        let cursor = Cursor::new(pager.clone(), 1, 0, false);
+        let cursor = Cursor::new(pager.clone(), 1, 0);
         cursor.leaf_node_split_and_insert(15, &row_bytes)?;
 
         let node_1 = Node::try_from(page_1)?;
