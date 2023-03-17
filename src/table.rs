@@ -165,6 +165,7 @@ impl Table {
         Rc::try_unwrap(self.pager).unwrap().into_inner().flush()
     }
 
+    /// Inserts new row.
     pub fn insert(&mut self, r: &Row) -> anyhow::Result<()> {
         let data = r.serialize();
 
@@ -192,6 +193,13 @@ impl Table {
         cursor.insert(r.id, &data)?;
 
         Ok(())
+    }
+
+    /// Searches for particular saved row.
+    pub fn search(&mut self, id: u32) -> anyhow::Result<Option<Row>> {
+        let cursor = self.cursor_find(self.root_page_num, id)?;
+
+        Ok(cursor.try_into()?)
     }
 
     pub fn collect(&mut self) -> anyhow::Result<Vec<Row>> {
@@ -234,27 +242,31 @@ impl Table {
     /// If the key is not present, return the position where it should be inserted.
     fn cursor_find(&mut self, page_num: u32, key: u32) -> anyhow::Result<Cursor> {
         let root_page = self.pager.borrow_mut().get_page(page_num)?;
-
         let root_node = Node::try_from(root_page.borrow().clone())?;
-
-        // TODO: set page_num properly in case
         let mut cursor = Cursor::new(self.pager.clone(), page_num, 0, false);
 
         match root_node.node_type {
             NodeType::Internal {
                 right_child,
                 child_pointer_pairs,
-            } => match child_pointer_pairs.binary_search_by_key(&key, |(_, k)| k.0) {
-                Ok(inx) => self.cursor_find(
-                    child_pointer_pairs
-                        .get(inx)
-                        .context("could not get value by index after binary search")?
-                        .0
-                         .0,
-                    key,
-                ),
-                Err(_) => self.cursor_find(right_child.0, key),
-            },
+            } => {
+                let inx = child_pointer_pairs
+                    .binary_search_by_key(&key, |(_, k)| k.0)
+                    .unwrap_or_else(|x| x);
+
+                if inx == child_pointer_pairs.len() {
+                    self.cursor_find(right_child.0, key)
+                } else {
+                    self.cursor_find(
+                        child_pointer_pairs
+                            .get(inx)
+                            .context("could not get value by index after binary search")?
+                            .0
+                             .0,
+                        key,
+                    )
+                }
+            }
             NodeType::Leaf { kvs, next_leaf: _ } => {
                 let inx = kvs
                     .binary_search_by_key(&key, |(k, _)| k.0)
@@ -470,6 +482,22 @@ mod tests {
 
         let rows = db.collect()?;
         assert_eq!(rows.len(), 50);
+
+        let row = db.search(10)?.unwrap();
+        assert_eq!(
+            row.email,
+            vector_to_array(str_as_bytes("b".repeat(10).as_str()))?
+        );
+        assert_eq!(
+            row.username,
+            vector_to_array(str_as_bytes("a".repeat(10).as_str()))?
+        );
+
+        let row = db.search(100)?;
+        assert!(row.is_none());
+
+        let row = db.search(50)?;
+        assert!(row.is_some());
 
         db.close()?;
 

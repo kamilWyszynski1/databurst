@@ -1,18 +1,20 @@
-use std::{any, cell::RefCell, rc::Rc};
+use std::{cell::RefCell, rc::Rc};
 
-use anyhow::{bail, Context, Ok};
+use anyhow::{bail, Context};
 
 use crate::{
     constants::LEAF_NODE_MAX_CELLS,
     node::{Key, Node, NodeType, Pointer},
     pager::Pager,
+    table::Row,
 };
 
+#[derive(Debug)]
 pub struct Cursor {
     pager: Rc<RefCell<Pager>>,
     pub end_of_table: bool,
 
-    page_num: u32,
+    pub page_num: u32,
     pub cell_num: u32,
 }
 
@@ -315,18 +317,31 @@ impl Cursor {
 
         Ok(())
     }
+}
 
-    pub fn advance(&mut self) -> anyhow::Result<()> {
-        let page_num = self.page_num;
-        let node = Node::try_from(self.pager.borrow_mut().get_page(page_num)?.borrow().clone())?;
+impl TryInto<Option<Row>> for Cursor {
+    type Error = anyhow::Error;
 
-        self.cell_num += 1;
+    fn try_into(self) -> anyhow::Result<Option<Row>, Self::Error> {
+        let page = self.pager.borrow_mut().get_page(self.page_num)?;
+        let node = Node::try_from(page)?;
+        match node.node_type {
+            NodeType::Internal {
+                right_child: _,
+                child_pointer_pairs: _,
+            } => bail!("cannot convert Internal Node into Row"),
+            NodeType::Leaf { kvs, next_leaf: _ } => {
+                if self.cell_num as usize >= kvs.len() {
+                    // not found
+                    return Ok(None);
+                }
 
-        if self.cell_num >= node.num_cells() {
-            self.end_of_table = true
+                let (_, data) = kvs.get(self.cell_num as usize).with_context(|| {
+                    format!("could not get {} kv from Leaf Node", self.cell_num)
+                })?;
+                return Ok(Some(Row::deserialize(&data)?));
+            }
         }
-
-        Ok(())
     }
 }
 
