@@ -1,9 +1,11 @@
 use anyhow::{anyhow, bail, Context};
-use std::{fmt::Debug, str::from_utf8};
+use std::{fmt::Debug, io::Write, path::Path, str::from_utf8};
 
 use crate::{
-    constants::{EMAIL_OFFSET, ID_OFFSET, ROWS_SIZE, TABLE_MAX_ROWS, USERNAME_OFFSET},
-    pager::Page,
+    constants::{
+        EMAIL_OFFSET, ID_OFFSET, ROWS_PER_PAGE, ROWS_SIZE, TABLE_MAX_ROWS, USERNAME_OFFSET,
+    },
+    pager::{Page, Pager},
 };
 
 macro_rules! field_size {
@@ -26,10 +28,11 @@ pub const ID_SIZE: usize = field_size!(Row::id);
 pub const USERNAME_SIZE: usize = field_size!(Row::username);
 pub const EMAIL_SIZE: usize = field_size!(Row::email);
 
+#[derive(PartialOrd)]
 pub struct Row {
-    id: u32,
-    username: [u8; 32],
-    email: [u8; 255],
+    pub id: u32,
+    pub username: [u8; 32],
+    pub email: [u8; 255],
 }
 
 impl TryFrom<Vec<&str>> for Row {
@@ -95,7 +98,7 @@ impl Debug for Row {
 }
 
 impl Row {
-    fn serialize(&self) -> Vec<u8> {
+    pub fn serialize(&self) -> Vec<u8> {
         let mut buffer = vec![];
         buffer.append(&mut self.id.to_be_bytes().to_vec());
         buffer.append(&mut self.username.to_vec());
@@ -131,43 +134,35 @@ impl Row {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Table {
     num_rows: usize,
-    pages: Vec<Page>,
+    // pages: Vec<Page>,
+    pager: Pager,
 }
 
 impl Table {
+    pub fn db_open<P: AsRef<Path>>(p: P) -> anyhow::Result<Self> {
+        let pager = Pager::new(p)?;
+        Ok(Self {
+            num_rows: pager.file_len / ROWS_SIZE,
+            pager,
+        })
+    }
+
+    /// Consumes Table and saves all content to file.
+    pub fn close(self) -> anyhow::Result<()> {
+        self.pager.flush()
+    }
+
     pub fn insert(&mut self, r: &Row) -> anyhow::Result<()> {
-        if self.pages.len() >= TABLE_MAX_ROWS {
+        if self.num_rows >= TABLE_MAX_ROWS {
             bail!("table is full")
         }
 
-        let mut bytes = r.serialize();
-
-        match self.pages.last_mut() {
-            Some(last_page) => {
-                if last_page.is_full() {
-                    // create new page
-                    self.pages.push(Page { rows: bytes });
-                } else {
-                    last_page.rows.append(&mut bytes);
-                }
-            }
-            None => self.pages = vec![Page { rows: bytes }],
-        }
-
+        self.pager.insert(self.num_rows, r.serialize())?;
         self.num_rows += 1;
 
-        Ok(())
-    }
-
-    pub fn select(&mut self) -> anyhow::Result<()> {
-        self.pages.iter().for_each(|page| {
-            page.into_iter().for_each(|bytes| {
-                Row::deserialize(bytes).unwrap();
-            })
-        });
         Ok(())
     }
 }
@@ -178,8 +173,8 @@ impl<'a> IntoIterator for &'a Table {
     type IntoIter = std::vec::IntoIter<Self::Item>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.pages
-            .iter()
+        self.pager
+            .into_iter()
             .flat_map(|page| {
                 let rows: Vec<Row> = page
                     .into_iter()
@@ -192,7 +187,7 @@ impl<'a> IntoIterator for &'a Table {
     }
 }
 
-fn vector_to_array<T, const N: usize>(mut v: Vec<T>) -> anyhow::Result<[T; N]>
+pub fn vector_to_array<T, const N: usize>(mut v: Vec<T>) -> anyhow::Result<[T; N]>
 where
     T: Default,
 {
@@ -210,23 +205,25 @@ where
     }
 }
 
+pub fn str_as_bytes(s: &str) -> Vec<u8> {
+    let mut buffer = vec![];
+    buffer.write_all(s.as_bytes()).unwrap();
+
+    buffer.to_vec()
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::table::ROWS_SIZE;
+    use anyhow::Ok;
+    use tempdir::TempDir;
 
     use super::{vector_to_array, Row, Table};
-    use std::io::Write;
+    use crate::table::{str_as_bytes, ROWS_SIZE};
+    use std::{fs::File, io::Write};
 
     #[test]
     fn test_row_size() {
         assert_eq!(291, ROWS_SIZE);
-    }
-
-    fn str_as_bytes(s: &str) -> Vec<u8> {
-        let mut buffer = vec![];
-        buffer.write_all(s.as_bytes()).unwrap();
-
-        buffer.to_vec()
     }
 
     #[test]
@@ -278,22 +275,31 @@ mod tests {
             username: vector_to_array(str_as_bytes("elo3")).unwrap(),
             email: vector_to_array(str_as_bytes("asdasdkpoqkwepoqkwepoqw3")).unwrap(),
         };
-        let mut table = Table::default();
-        table.insert(&r)?;
-        table.insert(&r2)?;
-        table.insert(&r3)?;
 
-        table.into_iter().for_each(|r| {
-            dbg!(&r);
-        });
+        let tmp_dir = TempDir::new("databurst")?;
+        let file_path = tmp_dir.path().join("my.db");
+        let file = File::create(&file_path)?;
 
-        let mut table = Table::default();
-        // check pages
-        for _ in 0..100 {
-            table.insert(&r)?;
-        }
-        assert_eq!(table.num_rows, 100);
-        assert_eq!(table.pages.len(), 8);
+        let mut db = Table::db_open(&file_path)?;
+
+        db.insert(&r)?;
+        db.insert(&r2)?;
+        db.insert(&r3)?;
+
+        let mut v = vec![r, r2, r3];
+        v.sort_by_key(|r| r.id);
+
+        let mut got = db.into_iter().collect::<Vec<Row>>();
+        got.sort_by_key(|r| r.id);
+
+        assert_eq!(v, got);
+
+        db.close()?;
+        let db = Table::db_open(&file_path)?;
+
+        let mut got = db.into_iter().collect::<Vec<Row>>();
+        got.sort_by_key(|r| r.id);
+        assert_eq!(v, got);
 
         Ok(())
     }
