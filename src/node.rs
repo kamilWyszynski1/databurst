@@ -43,6 +43,7 @@ pub enum NodeType {
         /// Optional pointer to right next leaf. Enables robust select;
         next_leaf: Option<Pointer>,
     },
+    // TODO add index leaf
 }
 
 impl TryFrom<u8> for NodeType {
@@ -92,6 +93,11 @@ impl Node {
             is_root,
             parent,
         }
+    }
+
+    pub fn save(self, page_num: u32, pager: Rc<RefCell<Pager>>) -> anyhow::Result<()> {
+        pager.borrow_mut().get_page(page_num)?.borrow_mut().data = self.try_into()?;
+        Ok(())
     }
 
     pub fn is_leaf_node(&self) -> bool {

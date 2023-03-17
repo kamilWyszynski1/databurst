@@ -1,8 +1,5 @@
 use anyhow::{anyhow, bail, Context};
-use std::{
-    cell::RefCell, collections::BTreeMap, fmt::Debug, marker::PhantomData, path::Path, rc::Rc,
-    str::from_utf8,
-};
+use std::{cell::RefCell, fmt::Debug, marker::PhantomData, path::Path, rc::Rc, str::from_utf8};
 
 use crate::{
     constants::{EMAIL_OFFSET, ID_OFFSET, ROWS_SIZE, USERNAME_OFFSET},
@@ -148,19 +145,49 @@ impl Deserialize for Row {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct RowID {
     pub page_num: u32,
     pub cell_num: u32,
 }
 
+impl Serialize for RowID {
+    fn serialize(&self) -> Vec<u8> {
+        let mut buffer = vec![];
+        buffer.append(&mut self.page_num.to_be_bytes().to_vec());
+        buffer.append(&mut self.cell_num.to_be_bytes().to_vec());
+
+        buffer.append(&mut vec![0u8; ROWS_SIZE - buffer.len()]);
+
+        buffer
+    }
+}
+
+impl Deserialize for RowID {
+    fn deserialize(data: &[u8]) -> anyhow::Result<Self> {
+        let page_num_bytes = &data[ID_OFFSET..ID_SIZE];
+        let cell_num_bytes = &data[ID_OFFSET + ID_SIZE..ID_SIZE];
+
+        let page_num: u32 = u32::from_be_bytes(
+            page_num_bytes
+                .try_into()
+                .context("cannot convert id_bytes to array")?,
+        );
+        let cell_num: u32 = u32::from_be_bytes(
+            cell_num_bytes
+                .try_into()
+                .context("cannot convert id_bytes to array")?,
+        );
+
+        Ok(Self { page_num, cell_num })
+    }
+}
+
 #[derive(Debug)]
 pub struct Table<K, V> {
     pub root_page_num: u32,
+    pub root_index_num: u32,
     pub pager: Rc<RefCell<Pager>>,
-
-    // simple, primary key index
-    index: BTreeMap<u32, RowID>,
 
     marker: PhantomData<(K, V)>,
 }
@@ -171,28 +198,27 @@ impl<K, V> Table<K, V> {
 
         if pager.num_pages == 0 {
             // new database, need to initialize
-            // TODO: init
-            let root = pager.get_page(0)?;
-            let mut node = Node::try_from(root.borrow().clone())?;
-            node.is_root = true;
-            root.borrow_mut().data = node.try_into()?;
+            {
+                let root = pager.get_page(0)?;
+                let mut node = Node::try_from(root.borrow().clone())?;
+                node.is_root = true;
+                root.borrow_mut().data = node.try_into()?;
+            }
+
+            {
+                let index_root = pager.get_page(1)?;
+                let mut index_node = Node::try_from(index_root.borrow().clone())?;
+                index_node.is_root = true;
+                index_root.borrow_mut().data = index_node.try_into()?;
+            }
         }
 
-        let mut table = Self {
+        Ok(Self {
             root_page_num: 0,
+            root_index_num: 1,
             pager: Rc::new(RefCell::new(pager)),
-            index: BTreeMap::default(),
             marker: PhantomData,
-        };
-        table.rebuild_index()?;
-
-        Ok(table)
-    }
-
-    fn rebuild_index(&mut self) -> anyhow::Result<()> {
-        let cursor = self.cursor_start()?;
-        self.index = cursor.try_into()?;
-        Ok(())
+        })
     }
 
     fn update_index_for_node(&mut self, page_num: u32, node: Node) -> anyhow::Result<()> {
@@ -200,16 +226,17 @@ impl<K, V> Table<K, V> {
             NodeType::Internal {
                 right_child: _,
                 child_pointer_pairs: _,
-            } => bail!("could not update index for Interal node"),
+            } => {
+                bail!("could not update index for Interal node");
+            }
             NodeType::Leaf { kvs, next_leaf: _ } => {
                 for (cell_num, (Key(key), _)) in kvs.into_iter().enumerate() {
-                    self.index.insert(
-                        key,
-                        RowID {
-                            page_num,
-                            cell_num: cell_num as u32,
-                        },
-                    );
+                    let row_id = RowID {
+                        page_num,
+                        cell_num: cell_num as u32,
+                    };
+                    self.cursor_find(self.root_index_num, key)?
+                        .insert(key, &row_id.serialize())?;
                 }
             }
         }
@@ -287,12 +314,8 @@ where
 {
     /// Searches for particular saved row.
     pub fn search(&mut self, id: u32) -> anyhow::Result<Option<V>> {
-        let row_id = match self.index.get(&id) {
-            Some(row_id) => row_id,
-            None => return Ok(None),
-        };
+        let cursor = self.cursor_find(self.root_index_num, id)?;
 
-        let cursor = Cursor::new(self.pager.clone(), row_id.page_num, row_id.cell_num);
         Ok(match cursor.data()? {
             Some(data) => Some(V::deserialize(&data)?),
             None => None,
@@ -375,13 +398,13 @@ where
                 }
             }
         }
-
+        // cursor.insert(key, &data)?;
         match cursor.insert(key, &data)? {
             OperationInfo::Insert {
-                split_occured,
+                split_occurred,
                 metadata,
             } => {
-                if split_occured {
+                if split_occurred {
                     let metadata = metadata.context("SplitMetadata should be filled")?;
                     let left_node =
                         Node::try_from(self.pager.borrow_mut().get_page(metadata.new_left)?)?;
@@ -391,14 +414,16 @@ where
                         Node::try_from(self.pager.borrow_mut().get_page(metadata.new_right)?)?;
                     self.update_index_for_node(metadata.new_right, right_node)?;
                 } else {
-                    self.index.insert(
-                        key,
-                        RowID {
-                            page_num: cursor.page_num,
-                            cell_num: cursor.cell_num,
-                        },
-                    );
+                    let row_id = RowID {
+                        page_num: cursor.page_num,
+                        cell_num: cursor.cell_num,
+                    };
+                    self.cursor_find(self.root_index_num, key)?
+                        .insert(key, &row_id.serialize())?;
                 }
+            }
+            OperationInfo::Replace => {
+                dbg!(key, "replace occurred");
             }
         }
 
@@ -568,6 +593,8 @@ mod tests {
         }
 
         db.print(db.root_page_num, "".to_string())?;
+        println!();
+        db.print(db.root_index_num, "".to_string())?;
 
         let rows = db.collect()?;
         assert_eq!(rows.len(), 50);

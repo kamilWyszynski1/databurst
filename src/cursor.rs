@@ -16,9 +16,10 @@ pub struct SplitMetadata {
 /// Metadata about various, database operations.
 pub enum OperationInfo {
     Insert {
-        split_occured: bool,
+        split_occurred: bool,
         metadata: Option<SplitMetadata>,
     },
+    Replace,
 }
 
 #[derive(Debug)]
@@ -43,10 +44,28 @@ impl Cursor {
         // turn page's bytes into readable node
         let mut node = Node::try_from(page.borrow().clone())?;
 
+        // check if cell_num is already occupied, if key matches, replace value
+        if let NodeType::Leaf {
+            mut kvs,
+            next_leaf: _,
+        } = node.node_type.clone()
+        {
+            if let Some((Key(existing_key), existing_data)) = kvs.get_mut(self.cell_num as usize) {
+                if *existing_key == key {
+                    // replace and return
+                    *existing_data = data.to_vec();
+                    // turn node back into bytes
+                    page.borrow_mut().data = node.try_into()?;
+                    return Ok(OperationInfo::Replace);
+                }
+            }
+        }
+
+        // check if split is needed
         if node.num_cells() as usize >= LEAF_NODE_MAX_CELLS {
             let metadata = self.leaf_node_split_and_insert(key, data)?;
             return Ok(OperationInfo::Insert {
-                split_occured: true,
+                split_occurred: true,
                 metadata: Some(metadata),
             });
         }
@@ -67,7 +86,7 @@ impl Cursor {
         page.borrow_mut().data = node.try_into()?;
 
         Ok(OperationInfo::Insert {
-            split_occured: false,
+            split_occurred: false,
             metadata: None,
         })
     }
@@ -85,61 +104,99 @@ impl Cursor {
         let left_node = Node::try_from(left_page.clone())?;
 
         let right_page_num = self.pager.borrow().get_unused_page_num();
+        self.pager.borrow_mut().get_page(right_page_num)?; // alocate page
+
+        let is_root = left_node.is_root;
 
         {
-            let right_page = self.pager.borrow_mut().get_page(right_page_num)?;
-
             // All existing keys plus new key should be divided evenly between old (left) and new (right) nodes.
             if let NodeType::Leaf { mut kvs, next_leaf } = left_node.node_type.clone() {
                 kvs.insert(self.cell_num as usize, (key.into(), data.to_vec()));
                 let siblings_kvs = kvs.split_off((kvs.len() + 1) / 2);
 
-                left_page.borrow_mut().data = Node::new(
+                let mut left_node = Node::new(
                     NodeType::Leaf {
                         kvs,
                         next_leaf: Some(Pointer(right_page_num)),
                     },
                     false,
                     left_node.parent,
-                )
-                .try_into()?;
-                right_page.borrow_mut().data = Node::new(
+                );
+                let mut right_node = Node::new(
                     NodeType::Leaf {
                         kvs: siblings_kvs,
                         next_leaf,
                     },
                     false,
                     left_node.parent,
-                )
-                .try_into()?;
+                );
+
+                let left_child_max_key = left_node.max_key();
+                if is_root {
+                    // root page has to stay as it was, because of that we need to allocate another page
+                    // copy content and change that page data
+                    let new_left_page_num = self.pager.borrow().get_unused_page_num();
+                    let new_left_page = self.pager.borrow_mut().get_page(new_left_page_num)?;
+                    new_left_page.borrow_mut().data = left_page.borrow().data; // clone data
+
+                    // split the root
+                    let root = Node::new(
+                        NodeType::Internal {
+                            right_child: Pointer(right_page_num),
+                            child_pointer_pairs: vec![(
+                                Pointer(new_left_page_num),
+                                left_child_max_key.into(),
+                            )],
+                        },
+                        true,
+                        None,
+                    );
+                    left_page.borrow_mut().data = root.try_into()?; // rewrite root
+
+                    left_node.parent = Some(left_page_num);
+                    right_node.parent = Some(left_page_num);
+
+                    left_node.save(new_left_page_num, self.pager.clone())?;
+                    right_node.save(right_page_num, self.pager.clone())?;
+
+                    left_page_num = new_left_page_num; // change for SplitMetadata
+                } else {
+                    // update leaf's parent
+                    let page_num = left_node.parent.context("no parent")?;
+
+                    left_node.save(left_page_num, self.pager.clone())?;
+                    right_node.save(right_page_num, self.pager.clone())?;
+
+                    self.insert_into_internal(page_num, right_page_num, left_child_max_key)?;
+                }
             } else {
                 panic!("node is not a Leaf")
             }
         }
 
-        let left_child_max_key = Node::try_from(left_page.clone())?.max_key();
-        if left_node.is_root {
-            // root page has to stay as it was, because of that we need to allocate another page
-            // copy content and change that page data
-            left_page_num = self.pager.borrow().get_unused_page_num();
-            let new_left_page = self.pager.borrow_mut().get_page(left_page_num)?;
-            new_left_page.borrow_mut().data = left_page.borrow().data; // clone data
+        // let left_child_max_key = Node::try_from(left_page.clone())?.max_key();
+        // if left_node.is_root {
+        //     // root page has to stay as it was, because of that we need to allocate another page
+        //     // copy content and change that page data
+        //     left_page_num = self.pager.borrow().get_unused_page_num();
+        //     let new_left_page = self.pager.borrow_mut().get_page(left_page_num)?;
+        //     new_left_page.borrow_mut().data = left_page.borrow().data; // clone data
 
-            // split the root
-            let root = Node::new(
-                NodeType::Internal {
-                    right_child: Pointer(right_page_num),
-                    child_pointer_pairs: vec![(Pointer(left_page_num), left_child_max_key.into())],
-                },
-                true,
-                None,
-            );
-            left_page.borrow_mut().data = root.try_into()?; // rewrite root
-        } else {
-            // update leaf's parent
-            let page_num = left_node.parent.context("no parent")?;
-            self.insert_into_internal(page_num, right_page_num, left_child_max_key)?;
-        }
+        //     // split the root
+        //     let root = Node::new(
+        //         NodeType::Internal {
+        //             right_child: Pointer(right_page_num),
+        //             child_pointer_pairs: vec![(Pointer(left_page_num), left_child_max_key.into())],
+        //         },
+        //         true,
+        //         None,
+        //     );
+        //     left_page.borrow_mut().data = root.try_into()?; // rewrite root
+        // } else {
+        //     // update leaf's parent
+        //     let page_num = left_node.parent.context("no parent")?;
+        //     self.insert_into_internal(page_num, right_page_num, left_child_max_key)?;
+        // }
 
         Ok(SplitMetadata {
             new_left: left_page_num,
