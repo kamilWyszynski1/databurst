@@ -267,7 +267,7 @@ impl Table {
 
     #[cfg(test)]
     fn print(&self, page_num: u32, ident: String) -> anyhow::Result<()> {
-        use crate::node::Key;
+        use crate::node::{Key, Pointer};
 
         let node = Node::try_from(self.pager.borrow_mut().get_page(page_num)?)?;
 
@@ -277,13 +277,13 @@ impl Table {
                 child_pointer_pairs,
             } => {
                 println!(
-                    "{ident}({page_num}) internal [root: {}, parent: {}] (size {:?}, key {:?})",
+                    "{ident}({page_num}) internal [root: {}, parent: {}] ({:?}, key {:?})",
                     node.is_root,
                     node.parent.map(|x| x.to_string()).unwrap_or_default(),
                     child_pointer_pairs
                         .iter()
-                        .map(|(_, Key(key))| *key)
-                        .collect::<Vec<u32>>(),
+                        .map(|(Pointer(pointer), Key(key))| (*pointer, *key))
+                        .collect::<Vec<(u32, u32)>>(),
                     right_child
                 );
                 for (pointer, _) in child_pointer_pairs {
@@ -442,32 +442,11 @@ mod tests {
 
         Ok(())
     }
-    /*
-    (0) internal [root: true, parent: ] (size [4], key Pointer(6))
-     (7) internal [root: false, parent: 0] (size [2], key Pointer(1))
-      (2) leaf: [parent: 7](kvs: [1, 2], next_leaf: Some(Pointer(1)))
-      (1) leaf: [parent: 7](kvs: [3, 4], next_leaf: Some(Pointer(3)))
-     (6) internal [root: false, parent: 0] (size [6, 8, 10], key Pointer(8))
-      (3) leaf: [parent: 6](kvs: [5, 6], next_leaf: Some(Pointer(4)))
-      (4) leaf: [parent: 6](kvs: [7, 8], next_leaf: Some(Pointer(5)))
-      (5) leaf: [parent: 6](kvs: [9, 10], next_leaf: Some(Pointer(8)))
-      (8) leaf: [parent: 6](kvs: [11, 12, 13], next_leaf: None)
-
-    (0) internal [root: true, parent: ] (size [4, 8], key Pointer(10))
-     (7) internal [root: false, parent: 0] (size [2], key Pointer(1))
-      (2) leaf: [parent: 7](kvs: [1, 2], next_leaf: Some(Pointer(1)))
-      (1) leaf: [parent: 7](kvs: [3, 4], next_leaf: Some(Pointer(3)))
-     (8) leaf: [parent: 10](kvs: [11, 12], next_leaf: Some(Pointer(9)))
-     (10) internal [root: false, parent: 0] (size [10, 12], key Pointer(9))
-      (5) leaf: [parent: 10](kvs: [9, 10], next_leaf: Some(Pointer(8)))
-      (8) leaf: [parent: 10](kvs: [11, 12], next_leaf: Some(Pointer(9)))
-      (9) leaf: [parent: 10](kvs: [13, 14], next_leaf: None)
-     */
 
     #[test]
     fn test_table_multiple_inserts() -> anyhow::Result<()> {
         let mut rows = vec![];
-        for i in 1..=10 {
+        for i in 1..=20 {
             rows.push(Row {
                 id: i,
                 username: vector_to_array(str_as_bytes("a".repeat(i as usize % 32).as_str()))
