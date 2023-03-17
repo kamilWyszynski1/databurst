@@ -54,6 +54,21 @@ impl Cursor {
 
         Ok(())
     }
+    /// Create a new node and move half the cells over.
+    /// Insert the new value in one of the two nodes.
+    /// Update parent or create a new parent.
+    pub fn leaf_node_split_and_insert(&mut self, key: u32, data: &[u8]) -> anyhow::Result<()> {
+        let old_node = Node::try_from(self.pager.borrow_mut().get_page(self.page_num)?)?;
+        let new_page_num = self.pager.borrow().get_unused_page_num();
+
+        let new_node = Node::try_from(self.pager.borrow_mut().get_page(new_page_num)?)?;
+
+        // All existing keys plus new key should be divided
+        // evenly between old (left) and new (right) nodes.
+        // Starting from the right, move each key to correct position.
+
+        todo!()
+    }
 
     pub fn advance(&mut self) -> anyhow::Result<()> {
         let page_num = self.page_num;
