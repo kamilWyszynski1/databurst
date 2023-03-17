@@ -36,8 +36,8 @@ impl Page {
 #[derive(Debug)]
 pub struct Pager {
     f: File,
-    pub file_len: usize,
-    pub num_pages: usize,
+    pub file_len: u32,
+    pub num_pages: u32,
     pub pages_rc: [Option<Rc<RefCell<Page>>>; TABLE_MAX_PAGES],
 }
 
@@ -49,8 +49,8 @@ impl Pager {
             .create(true)
             .open(p)?;
 
-        let file_len = f.metadata()?.len() as usize;
-        let num_pages = file_len / PAGE_SIZE;
+        let file_len = f.metadata()?.len() as u32;
+        let num_pages = (file_len as usize / PAGE_SIZE) as u32;
 
         const INIT: Option<Rc<RefCell<Page>>> = None;
 
@@ -64,12 +64,12 @@ impl Pager {
 
     /// Until we start recycling free pages, new pages will always go onto the end of the database file.
     /// TODO: reuse already alocated(written) pages after deletion
-    pub fn get_unused_page_num(&self) -> usize {
+    pub fn get_unused_page_num(&self) -> u32 {
         self.num_pages
     }
 
-    pub fn get_page(&mut self, page_num: usize) -> anyhow::Result<Rc<RefCell<Page>>> {
-        if page_num > TABLE_MAX_PAGES {
+    pub fn get_page(&mut self, page_num: u32) -> anyhow::Result<Rc<RefCell<Page>>> {
+        if page_num as usize > TABLE_MAX_PAGES {
             bail!(
                 "tried to fetch pager number out of bounds: {} > {}",
                 page_num,
@@ -77,26 +77,26 @@ impl Pager {
             )
         }
 
-        if let Some(Some(page)) = self.pages_rc.get(page_num) {
+        if let Some(Some(page)) = self.pages_rc.get(page_num as usize) {
             return Ok(page.clone());
         }
 
         // not found
-        let mut num_pages = self.file_len / PAGE_SIZE;
+        let mut num_pages = self.file_len as usize / PAGE_SIZE;
 
         // We might save a partial page at the end of the file
-        if self.file_len % PAGE_SIZE == 1 {
+        if self.file_len as usize % PAGE_SIZE == 1 {
             num_pages += 1;
         }
 
-        let page = if num_pages >= page_num {
+        let page = if num_pages >= page_num as usize {
             // read and parse Row from the file
             let mut buf = vec![];
 
             let mut reader = BufReader::new(&self.f);
             // let reader = self.f.by_ref();
 
-            reader.seek(SeekFrom::Start((page_num * PAGE_SIZE).try_into()?))?;
+            reader.seek(SeekFrom::Start((page_num as usize * PAGE_SIZE).try_into()?))?;
             reader.take(PAGE_SIZE as u64).read_to_end(&mut buf)?;
 
             // let's split page into chunks
@@ -109,7 +109,7 @@ impl Pager {
         };
 
         let p = Rc::new(RefCell::new(page));
-        self.pages_rc[page_num] = Some(p.clone());
+        self.pages_rc[page_num as usize] = Some(p.clone());
 
         if page_num >= self.num_pages {
             self.num_pages = page_num + 1
