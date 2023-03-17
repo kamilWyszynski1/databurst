@@ -1,4 +1,4 @@
-use std::{any, cell::RefCell, rc::Rc};
+use std::{cell::RefCell, rc::Rc};
 
 use crate::{
     constants::{
@@ -238,7 +238,20 @@ impl Node {
         Ok(false)
     }
 
-    pub fn update_children_parent(&self)
+    /// Goes through all children and sets their parent as current node/page.
+    pub fn update_children_parent(
+        &self,
+        self_page_num: u32,
+        pager: Rc<RefCell<Pager>>,
+    ) -> anyhow::Result<()> {
+        for Pointer(pointer) in self.children_pointers()? {
+            let pointer_page = pager.borrow_mut().get_page(pointer)?;
+            let mut node = Node::try_from(pointer_page.clone())?;
+            node.parent = Some(self_page_num);
+            pointer_page.borrow_mut().data = node.try_into()?;
+        }
+        Ok(())
+    }
 
     /// Returns internal's node children. Returns error when node's a Leaf.
     pub fn children_pointers(&self) -> anyhow::Result<Vec<Pointer>> {

@@ -177,15 +177,7 @@ impl Cursor {
                             false,
                             node.parent,
                         );
-
-                        // update children's parent
-                        for Pointer(pointer) in new_node.children_pointers()? {
-                            let pointer_page = self.pager.borrow_mut().get_page(pointer)?;
-                            let mut node = Node::try_from(pointer_page.clone())?;
-                            node.parent = Some(new_page_num);
-                            pointer_page.borrow_mut().data = node.try_into()?;
-                        }
-
+                        new_node.update_children_parent(new_page_num, self.pager.clone())?;
                         new_page.borrow_mut().data = new_node.try_into()?;
                     }
                     // update old node
@@ -198,15 +190,7 @@ impl Cursor {
                             false,
                             node.parent,
                         );
-
-                        // update children's parent
-                        for Pointer(pointer) in node.children_pointers()? {
-                            let pointer_page = self.pager.borrow_mut().get_page(pointer)?;
-                            let mut node = Node::try_from(pointer_page.clone())?;
-                            node.parent = Some(page_num);
-                            pointer_page.borrow_mut().data = node.try_into()?;
-                        }
-
+                        node.update_children_parent(page_num, self.pager.clone())?;
                         page.borrow_mut().data = node.try_into()?;
                     }
 
@@ -223,15 +207,10 @@ impl Cursor {
                         new_root_left_child_page.borrow_mut().data = page.borrow().data;
                         {
                             let mut node = Node::try_from(new_root_left_child_page.clone())?;
-
-                            // update children's parent
-                            for Pointer(pointer) in node.children_pointers()? {
-                                let pointer_page = self.pager.borrow_mut().get_page(pointer)?;
-                                let mut node = Node::try_from(pointer_page.clone())?;
-                                node.parent = Some(new_root_left_child_page_num);
-                                pointer_page.borrow_mut().data = node.try_into()?;
-                            }
-
+                            node.update_children_parent(
+                                new_root_left_child_page_num,
+                                self.pager.clone(),
+                            )?;
                             node.remove_overriding_pointers(self.pager.clone())?;
                             new_root_left_child_page.borrow_mut().data = node.try_into()?;
                         }

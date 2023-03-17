@@ -446,7 +446,7 @@ mod tests {
     #[test]
     fn test_table_multiple_inserts() -> anyhow::Result<()> {
         let mut rows = vec![];
-        for i in 1..=20 {
+        for i in 1..=50 {
             rows.push(Row {
                 id: i,
                 username: vector_to_array(str_as_bytes("a".repeat(i as usize % 32).as_str()))
@@ -467,6 +467,9 @@ mod tests {
         }
 
         db.print(db.root_page_num, "".to_string())?;
+
+        let rows = db.collect()?;
+        assert_eq!(rows.len(), 50);
 
         db.close()?;
 
