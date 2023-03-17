@@ -176,7 +176,7 @@ impl Table {
         let node =
             Node::try_from(page.borrow().clone()).context("could not create Node from Page")?;
 
-        let num_cells = node.num_cells() as u32;
+        let num_cells = node.num_cells();
         let key_to_insert = r.id;
 
         let cursor = self.cursor_find(key_to_insert)?;
@@ -264,6 +264,7 @@ impl Table {
         Ok(cursor)
     }
 
+    #[cfg(test)]
     fn print(&self, page_num: u32) -> anyhow::Result<()> {
         let node = Node::try_from(self.pager.borrow_mut().get_page(page_num)?)?;
 
@@ -435,7 +436,7 @@ mod tests {
     #[test]
     fn test_table_multiple_inserts() -> anyhow::Result<()> {
         let mut rows = vec![];
-        for i in 0..14 {
+        for i in 1..=14 {
             rows.push(Row {
                 id: i,
                 username: vector_to_array(str_as_bytes("a".repeat(i as usize % 32).as_str()))
