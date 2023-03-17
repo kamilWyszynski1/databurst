@@ -9,6 +9,7 @@ use crate::table::Table;
 mod cli;
 mod constants;
 mod cursor;
+mod node;
 mod pager;
 mod table;
 

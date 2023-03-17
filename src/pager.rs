@@ -1,5 +1,8 @@
-use crate::constants::{PAGE_SIZE, ROWS_PER_PAGE, ROWS_SIZE, TABLE_MAX_PAGES};
-use anyhow::{bail, Ok};
+use crate::{
+    constants::{PAGE_SIZE, TABLE_MAX_PAGES},
+    table::vector_to_array,
+};
+use anyhow::bail;
 use std::{
     cell::RefCell,
     fs::{File, OpenOptions},
@@ -8,43 +11,25 @@ use std::{
     rc::Rc,
 };
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct Page {
-    pub meta: String,
-    pub chunks: [Option<Rc<RefCell<Vec<u8>>>>; ROWS_PER_PAGE],
+    pub data: [u8; PAGE_SIZE],
 }
 
 impl Page {
     fn new() -> Self {
-        const INIT: Option<Rc<RefCell<Vec<u8>>>> = None;
         Self {
-            chunks: [INIT; ROWS_PER_PAGE],
-            meta: String::default(),
+            data: [0; PAGE_SIZE],
         }
     }
 
-    pub fn get(&mut self, inx: usize) -> anyhow::Result<Rc<RefCell<Vec<u8>>>> {
-        match self.chunks.get(inx) {
-            Some(got) => match got {
-                Some(hit) => Ok(hit.clone()),
-                None => {
-                    let data: Rc<RefCell<Vec<u8>>> = Rc::default();
-                    self.chunks[inx] = Some(data.clone());
-                    Ok(data)
-                }
-            },
-            None => bail!("index out of range"),
-        }
+    fn content(&self) -> Vec<u8> {
+        self.data.to_vec()
     }
 
-    fn content(self) -> Vec<u8> {
-        let a: Vec<u8> = self
-            .chunks
-            .into_iter()
-            .filter(Option::is_some)
-            .flat_map(|r| r.unwrap().take())
-            .collect();
-        a
+    /// get_ptr_from_offset fetches a slice of bytes from certain offset and of certain size.
+    pub fn get_ptr_from_offset(&self, offset: usize, size: usize) -> &[u8] {
+        &self.data[offset..offset + size]
     }
 }
 
@@ -52,6 +37,7 @@ impl Page {
 pub struct Pager {
     f: File,
     pub file_len: usize,
+    pub num_pages: usize,
     pub pages_rc: [Option<Rc<RefCell<Page>>>; TABLE_MAX_PAGES],
 }
 
@@ -64,12 +50,14 @@ impl Pager {
             .open(p)?;
 
         let file_len = f.metadata()?.len() as usize;
+        let num_pages = file_len / PAGE_SIZE;
 
         const INIT: Option<Rc<RefCell<Page>>> = None;
 
         Ok(Self {
             f,
             file_len,
+            num_pages,
             pages_rc: [INIT; TABLE_MAX_PAGES],
         })
     }
@@ -107,11 +95,7 @@ impl Pager {
 
             // let's split page into chunks
             let mut page = Page::new();
-            for (i, chunk) in buf.chunks(ROWS_SIZE).enumerate() {
-                page.chunks[i] = Some(Rc::new(RefCell::new(chunk.to_vec())));
-            }
-
-            page.chunks[0] = Some(Rc::new(RefCell::new(buf)));
+            page.data = vector_to_array(buf)?;
 
             page
         } else {
@@ -121,9 +105,14 @@ impl Pager {
         let p = Rc::new(RefCell::new(page));
         self.pages_rc[page_num] = Some(p.clone());
 
+        if page_num >= self.num_pages {
+            self.num_pages = page_num + 1
+        }
+
         Ok(p)
     }
 
+    /// Gets pages content and write it to file filling missing bytes.
     pub fn flush(mut self) -> anyhow::Result<()> {
         for (i, page) in self
             .pages_rc
@@ -135,7 +124,9 @@ impl Pager {
             // go into proper place in file
             self.f.seek(SeekFrom::Start((i * PAGE_SIZE).try_into()?))?;
             // write content
-            let content = page.take().content();
+            let mut content = page.borrow().content();
+
+            content.append(&mut vec![0u8; PAGE_SIZE - content.len()]);
 
             self.f.write_all(&content)?;
         }
