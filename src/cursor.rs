@@ -1,6 +1,6 @@
-use std::{cell::RefCell, rc::Rc};
+use std::{any, cell::RefCell, rc::Rc};
 
-use anyhow::Ok;
+use anyhow::{Context, Ok};
 
 use crate::{
     constants::LEAF_NODE_MAX_CELLS,
@@ -54,9 +54,9 @@ impl Cursor {
                 right_child: _,
                 child_pointer_pairs: _,
             } => todo!(),
-            crate::node::NodeType::Leaf(ref mut kvs) => {
+            crate::node::NodeType::Leaf { kvs, next_leaf: _ } => {
                 // cell_num was set by binary search, it will be inserted in order
-                kvs.insert(self.cell_num as usize, (key, data.to_vec()));
+                kvs.insert(self.cell_num as usize, (key.into(), data.to_vec()));
             }
         }
 
@@ -79,14 +79,32 @@ impl Cursor {
             let right_page = self.pager.borrow_mut().get_page(right_page_num)?;
 
             // All existing keys plus new key should be divided evenly between old (left) and new (right) nodes.
-            if let NodeType::Leaf(mut kvs) = left_node.node_type {
-                kvs.insert(self.cell_num as usize, (key, data.to_vec()));
+            if let NodeType::Leaf {
+                mut kvs,
+                next_leaf: _,
+            } = left_node.node_type
+            {
+                kvs.insert(self.cell_num as usize, (key.into(), data.to_vec()));
                 let siblings_kvs = kvs.split_off((kvs.len() + 1) / 2);
 
-                left_page.borrow_mut().data =
-                    Node::new(NodeType::Leaf(kvs), false, left_node.parent).try_into()?;
-                right_page.borrow_mut().data =
-                    Node::new(NodeType::Leaf(siblings_kvs), false, left_node.parent).try_into()?;
+                left_page.borrow_mut().data = Node::new(
+                    NodeType::Leaf {
+                        kvs,
+                        next_leaf: Some(Pointer(right_page_num)),
+                    },
+                    false,
+                    left_node.parent,
+                )
+                .try_into()?;
+                right_page.borrow_mut().data = Node::new(
+                    NodeType::Leaf {
+                        kvs: siblings_kvs,
+                        next_leaf: None,
+                    },
+                    false,
+                    left_node.parent,
+                )
+                .try_into()?;
             } else {
                 panic!("node is not a Leaf")
             }
@@ -104,7 +122,10 @@ impl Cursor {
             let root = Node::new(
                 NodeType::Internal {
                     right_child: Pointer(right_page_num),
-                    child_pointer_pairs: vec![(Pointer(new_left_page_num), left_child_max_key)],
+                    child_pointer_pairs: vec![(
+                        Pointer(new_left_page_num),
+                        left_child_max_key.into(),
+                    )],
                 },
                 true,
                 None,
@@ -112,6 +133,46 @@ impl Cursor {
             left_page.borrow_mut().data = root.try_into()?; // rewrite root
         } else {
             unimplemented!()
+        }
+
+        Ok(())
+    }
+
+    pub fn select(&mut self) -> anyhow::Result<Vec<Vec<u8>>> {
+        let mut data = vec![];
+        self.select_all(self.page_num, &mut data)?;
+
+        Ok(data)
+    }
+
+    fn select_all(&mut self, page_num: u32, data: &mut Vec<Vec<u8>>) -> anyhow::Result<()> {
+        let page = self.pager.borrow_mut().get_page(page_num)?;
+        let node = Node::try_from(page)?;
+
+        match node.node_type {
+            NodeType::Internal {
+                right_child: _,
+                child_pointer_pairs,
+            } => {
+                // go to the lowest leaf, then we will use `next_leaf` field to traverse all leafs
+                self.select_all(
+                    child_pointer_pairs
+                        .get(0)
+                        .context("could not get first child in internal node")?
+                        .0
+                         .0,
+                    data,
+                )?;
+            }
+            NodeType::Leaf { kvs, next_leaf } => {
+                for (_, row_bytes) in kvs {
+                    data.push(row_bytes);
+                }
+
+                if let Some(Pointer(next)) = next_leaf {
+                    self.select_all(next, data)?; // go to the next leaf
+                }
+            }
         }
 
         Ok(())
