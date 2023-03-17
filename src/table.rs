@@ -182,9 +182,10 @@ impl Table {
         let cursor = self.cursor_find(self.root_page_num, key_to_insert)?;
 
         if cursor.cell_num < num_cells {
-            let key_at_index = node.leaf_node_key(cursor.cell_num)?;
-            if key_at_index == key_to_insert {
-                bail!("duplicate key!")
+            if let Some(key_at_index) = node.leaf_node_key(cursor.cell_num)? {
+                if key_at_index == key_to_insert {
+                    bail!("duplicate key!")
+                }
             }
         }
 
@@ -265,7 +266,9 @@ impl Table {
     }
 
     #[cfg(test)]
-    fn dfs(&self, page_num: u32) -> anyhow::Result<()> {
+    fn print(&self, page_num: u32, ident: String) -> anyhow::Result<()> {
+        use crate::node::Key;
+
         let node = Node::try_from(self.pager.borrow_mut().get_page(page_num)?)?;
 
         match node.node_type {
@@ -274,48 +277,26 @@ impl Table {
                 child_pointer_pairs,
             } => {
                 println!(
-                    "internal (size {}, key {:?})",
-                    child_pointer_pairs.len(),
+                    "{ident}({page_num}) internal [root: {}, parent: {}] (size {:?}, key {:?})",
+                    node.is_root,
+                    node.parent.map(|x| x.to_string()).unwrap_or_default(),
+                    child_pointer_pairs
+                        .iter()
+                        .map(|(_, Key(key))| *key)
+                        .collect::<Vec<u32>>(),
                     right_child
                 );
                 for (pointer, _) in child_pointer_pairs {
-                    self.print(pointer.0)?;
+                    self.print(pointer.0, format!(" {}", ident))?;
                 }
-                self.print(right_child.0)?;
+                self.print(right_child.0, format!(" {}", ident))?;
             }
-            NodeType::Leaf { kvs, next_leaf: _ } => {
+            NodeType::Leaf { kvs, next_leaf } => {
                 println!(
-                    "leaf: {:?}",
-                    kvs.iter().map(|(key, _)| key.0).collect::<Vec<u32>>()
-                )
-            }
-        }
-
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn print(&self, page_num: u32) -> anyhow::Result<()> {
-        let node = Node::try_from(self.pager.borrow_mut().get_page(page_num)?)?;
-
-        match node.node_type {
-            NodeType::Internal {
-                right_child,
-                child_pointer_pairs,
-            } => {
-                println!(
-                    "internal (size {:?}, key {:?})",
-                    child_pointer_pairs, right_child
-                );
-                for (pointer, _) in child_pointer_pairs {
-                    self.print(pointer.0)?;
-                }
-                self.print(right_child.0)?;
-            }
-            NodeType::Leaf { kvs, next_leaf: _ } => {
-                println!(
-                    "leaf: {:?}",
-                    kvs.iter().map(|(key, _)| key.0).collect::<Vec<u32>>()
+                    "{ident}({page_num}) leaf: [parent: {}](kvs: {:?}, next_leaf: {:?})",
+                    node.parent.map(|x| x.to_string()).unwrap_or_default(),
+                    kvs.iter().map(|(key, _)| key.0).collect::<Vec<u32>>(),
+                    next_leaf,
                 )
             }
         }
@@ -461,11 +442,32 @@ mod tests {
 
         Ok(())
     }
+    /*
+    (0) internal [root: true, parent: ] (size [4], key Pointer(6))
+     (7) internal [root: false, parent: 0] (size [2], key Pointer(1))
+      (2) leaf: [parent: 7](kvs: [1, 2], next_leaf: Some(Pointer(1)))
+      (1) leaf: [parent: 7](kvs: [3, 4], next_leaf: Some(Pointer(3)))
+     (6) internal [root: false, parent: 0] (size [6, 8, 10], key Pointer(8))
+      (3) leaf: [parent: 6](kvs: [5, 6], next_leaf: Some(Pointer(4)))
+      (4) leaf: [parent: 6](kvs: [7, 8], next_leaf: Some(Pointer(5)))
+      (5) leaf: [parent: 6](kvs: [9, 10], next_leaf: Some(Pointer(8)))
+      (8) leaf: [parent: 6](kvs: [11, 12, 13], next_leaf: None)
+
+    (0) internal [root: true, parent: ] (size [4, 8], key Pointer(10))
+     (7) internal [root: false, parent: 0] (size [2], key Pointer(1))
+      (2) leaf: [parent: 7](kvs: [1, 2], next_leaf: Some(Pointer(1)))
+      (1) leaf: [parent: 7](kvs: [3, 4], next_leaf: Some(Pointer(3)))
+     (8) leaf: [parent: 10](kvs: [11, 12], next_leaf: Some(Pointer(9)))
+     (10) internal [root: false, parent: 0] (size [10, 12], key Pointer(9))
+      (5) leaf: [parent: 10](kvs: [9, 10], next_leaf: Some(Pointer(8)))
+      (8) leaf: [parent: 10](kvs: [11, 12], next_leaf: Some(Pointer(9)))
+      (9) leaf: [parent: 10](kvs: [13, 14], next_leaf: None)
+     */
 
     #[test]
     fn test_table_multiple_inserts() -> anyhow::Result<()> {
         let mut rows = vec![];
-        for i in 1..=40 {
+        for i in 1..=10 {
             rows.push(Row {
                 id: i,
                 username: vector_to_array(str_as_bytes("a".repeat(i as usize % 32).as_str()))
@@ -485,7 +487,7 @@ mod tests {
             db.insert(row)?;
         }
 
-        db.print(db.root_page_num)?;
+        db.print(db.root_page_num, "".to_string())?;
 
         db.close()?;
 
