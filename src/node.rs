@@ -62,6 +62,17 @@ impl Node {
         }
     }
 
+    pub fn leaf_node_key(&self, cell_num: usize) -> anyhow::Result<u32> {
+        match self.node_type {
+            NodeType::Internal(_, _) => bail!("leaf_node_key called for Internal"),
+            NodeType::Leaf(ref values) => Ok(values
+                .get(cell_num)
+                .context("could not get value by cell_num")?
+                .clone()
+                .0),
+        }
+    }
+
     pub fn num_cells(&self) -> u32 {
         match &self.node_type {
             NodeType::Internal(_, _) => todo!(),
