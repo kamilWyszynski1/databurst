@@ -6,6 +6,6 @@ pub const EMAIL_OFFSET: usize = USERNAME_OFFSET + USERNAME_SIZE;
 pub const ROWS_SIZE: usize = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE;
 
 pub const TABLE_MAX_PAGES: usize = 100;
-pub const PAGE_SIZE: usize = 4096; // 4KB
+pub const PAGE_SIZE: usize = ROWS_SIZE * 15; // 4KB
 pub const ROWS_PER_PAGE: usize = PAGE_SIZE / ROWS_SIZE;
 pub const TABLE_MAX_ROWS: usize = ROWS_PER_PAGE * TABLE_MAX_PAGES;

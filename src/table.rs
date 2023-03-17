@@ -1,11 +1,11 @@
 use anyhow::{anyhow, bail, Context};
-use std::{fmt::Debug, io::Write, path::Path, str::from_utf8};
+use std::{cell::RefCell, fmt::Debug, path::Path, rc::Rc, str::from_utf8};
 
 use crate::{
     constants::{
         EMAIL_OFFSET, ID_OFFSET, ROWS_PER_PAGE, ROWS_SIZE, TABLE_MAX_ROWS, USERNAME_OFFSET,
     },
-    pager::{Page, Pager},
+    pager::Pager,
 };
 
 macro_rules! field_size {
@@ -28,7 +28,7 @@ pub const ID_SIZE: usize = field_size!(Row::id);
 pub const USERNAME_SIZE: usize = field_size!(Row::username);
 pub const EMAIL_SIZE: usize = field_size!(Row::email);
 
-#[derive(PartialOrd)]
+#[derive(PartialOrd, Clone)]
 pub struct Row {
     pub id: u32,
     pub username: [u8; 32],
@@ -39,7 +39,6 @@ impl TryFrom<Vec<&str>> for Row {
     type Error = anyhow::Error;
 
     fn try_from(value: Vec<&str>) -> Result<Self, Self::Error> {
-        dbg!(&value);
         if value.len() != 3 {
             bail!("require 3 element")
         }
@@ -104,6 +103,8 @@ impl Row {
         buffer.append(&mut self.username.to_vec());
         buffer.append(&mut self.email.to_vec());
 
+        assert_eq!(buffer.len(), ROWS_SIZE);
+
         buffer
     }
 
@@ -155,35 +156,60 @@ impl Table {
         self.pager.flush()
     }
 
+    fn row_slot(&mut self, row_num: usize) -> anyhow::Result<Option<Rc<RefCell<Vec<u8>>>>> {
+        let page_num = row_num / ROWS_PER_PAGE;
+        let page = self.pager.get_page(page_num)?;
+
+        let x = Ok(Some(page.try_borrow_mut()?.get(row_num % ROWS_PER_PAGE)?));
+        x
+    }
+
     pub fn insert(&mut self, r: &Row) -> anyhow::Result<()> {
         if self.num_rows >= TABLE_MAX_ROWS {
             bail!("table is full")
         }
 
-        self.pager.insert(self.num_rows, r.serialize())?;
+        let mut data = r.serialize();
+        match self.row_slot(self.num_rows)? {
+            Some(place) => {
+                place.try_borrow_mut()?.append(&mut data);
+                println!("saved");
+            }
+            None => bail!("could not find place to save row"),
+        }
+
         self.num_rows += 1;
 
         Ok(())
     }
-}
 
-/// Goes through all saved rows, deserialize them.
-impl<'a> IntoIterator for &'a Table {
-    type Item = Row;
-    type IntoIter = std::vec::IntoIter<Self::Item>;
+    #[cfg(test)]
+    fn collect(&mut self) -> anyhow::Result<Vec<Row>> {
+        let mut rows = vec![];
+        for i in 0..self.num_rows {
+            match self.row_slot(i)? {
+                Some(place) => {
+                    let row = Row::deserialize(&place.borrow().clone())?;
+                    rows.push(row);
+                }
+                None => bail!("could not find row in saved content"),
+            }
+        }
+        Ok(rows)
+    }
 
-    fn into_iter(self) -> Self::IntoIter {
-        self.pager
-            .into_iter()
-            .flat_map(|page| {
-                let rows: Vec<Row> = page
-                    .into_iter()
-                    .map(|bytes| Row::deserialize(bytes).unwrap())
-                    .collect();
-                rows
-            })
-            .collect::<Vec<Row>>()
-            .into_iter()
+    pub fn select(&mut self) -> anyhow::Result<()> {
+        for i in 0..self.num_rows {
+            match self.row_slot(i)? {
+                Some(place) => {
+                    let row = Row::deserialize(&place.borrow().clone())?;
+
+                    println!("row {}, {:?}", i, row)
+                }
+                None => bail!("could not find row in saved content"),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -205,21 +231,21 @@ where
     }
 }
 
-pub fn str_as_bytes(s: &str) -> Vec<u8> {
-    let mut buffer = vec![];
-    buffer.write_all(s.as_bytes()).unwrap();
-
-    buffer.to_vec()
-}
-
 #[cfg(test)]
 mod tests {
     use anyhow::Ok;
     use tempdir::TempDir;
 
     use super::{vector_to_array, Row, Table};
-    use crate::table::{str_as_bytes, ROWS_SIZE};
+    use crate::table::ROWS_SIZE;
     use std::{fs::File, io::Write};
+
+    pub fn str_as_bytes(s: &str) -> Vec<u8> {
+        let mut buffer = vec![];
+        buffer.write_all(s.as_bytes()).unwrap();
+
+        buffer.to_vec()
+    }
 
     #[test]
     fn test_row_size() {
@@ -260,7 +286,7 @@ mod tests {
 
     #[test]
     fn test_table() -> anyhow::Result<()> {
-        let r = Row {
+        let r1 = Row {
             id: 1,
             username: vector_to_array(str_as_bytes("a".repeat(32).as_str())).unwrap(),
             email: vector_to_array(str_as_bytes("a".repeat(255).as_str())).unwrap(),
@@ -278,28 +304,63 @@ mod tests {
 
         let tmp_dir = TempDir::new("databurst")?;
         let file_path = tmp_dir.path().join("my.db");
-        let file = File::create(&file_path)?;
+        File::create(&file_path)?;
 
         let mut db = Table::db_open(&file_path)?;
 
-        db.insert(&r)?;
+        let wanted = vec![r1.clone(), r2.clone(), r3.clone()];
+
+        db.insert(&r1)?;
         db.insert(&r2)?;
         db.insert(&r3)?;
 
-        let mut v = vec![r, r2, r3];
-        v.sort_by_key(|r| r.id);
-
-        let mut got = db.into_iter().collect::<Vec<Row>>();
+        let mut got = db.collect()?;
         got.sort_by_key(|r| r.id);
-
-        assert_eq!(v, got);
+        assert_eq!(wanted, got);
 
         db.close()?;
-        let db = Table::db_open(&file_path)?;
+        let mut db = Table::db_open(&file_path)?;
 
-        let mut got = db.into_iter().collect::<Vec<Row>>();
+        let mut got = db.collect()?;
         got.sort_by_key(|r| r.id);
-        assert_eq!(v, got);
+        assert_eq!(wanted, got);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_table_multiple_inserts() -> anyhow::Result<()> {
+        let mut rows = vec![];
+        for i in 0..1000 {
+            rows.push(Row {
+                id: i,
+                username: vector_to_array(str_as_bytes("a".repeat(i as usize % 32).as_str()))
+                    .unwrap(),
+                email: vector_to_array(str_as_bytes("b".repeat(i as usize % 255).as_str()))
+                    .unwrap(),
+            })
+        }
+
+        let tmp_dir = TempDir::new("databurst")?;
+        let file_path = tmp_dir.path().join("my.db");
+        File::create(&file_path)?;
+
+        let mut db = Table::db_open(&file_path)?;
+
+        for row in &rows {
+            db.insert(row)?;
+        }
+
+        let mut got = db.collect()?;
+        got.sort_by_key(|r| r.id);
+        assert_eq!(rows, got);
+
+        db.close()?;
+        let mut db = Table::db_open(&file_path)?;
+
+        let mut got = db.collect()?;
+        got.sort_by_key(|r| r.id);
+        assert_eq!(rows, got);
 
         Ok(())
     }
