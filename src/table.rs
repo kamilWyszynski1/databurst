@@ -1,5 +1,10 @@
-use anyhow::{bail, Context};
+use anyhow::{anyhow, bail, Context};
 use std::{fmt::Debug, str::from_utf8};
+
+use crate::{
+    constants::{EMAIL_OFFSET, ID_OFFSET, ROWS_SIZE, TABLE_MAX_ROWS, USERNAME_OFFSET},
+    pager::Page,
+};
 
 macro_rules! field_size {
     ($t:ident :: $field:ident) => {{
@@ -17,19 +22,54 @@ macro_rules! field_size {
     }};
 }
 
-const ID_SIZE: usize = field_size!(Row::id);
-const USERNAME_SIZE: usize = field_size!(Row::username);
-const EMAIL_SIZE: usize = field_size!(Row::email);
+pub const ID_SIZE: usize = field_size!(Row::id);
+pub const USERNAME_SIZE: usize = field_size!(Row::username);
+pub const EMAIL_SIZE: usize = field_size!(Row::email);
 
-const ID_OFFSET: usize = 0;
-const USERNAME_OFFSET: usize = ID_OFFSET + ID_SIZE;
-const EMAIL_OFFSET: usize = USERNAME_OFFSET + USERNAME_SIZE;
-const ROWS_SIZE: usize = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE;
-
-struct Row {
+pub struct Row {
     id: u32,
     username: [u8; 32],
     email: [u8; 255],
+}
+
+impl TryFrom<Vec<&str>> for Row {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Vec<&str>) -> Result<Self, Self::Error> {
+        dbg!(&value);
+        if value.len() != 3 {
+            bail!("require 3 element")
+        }
+
+        let id: u32 = value[0].parse().context("could not parse id")?;
+        let username: [u8; 32] =
+            vector_to_array(value[1].into()).context("could not parse username")?;
+        let email: [u8; 255] = vector_to_array(value[2].into()).context("could not parse email")?;
+
+        Ok(Self {
+            id,
+            username,
+            email,
+        })
+    }
+}
+
+impl TryFrom<(u32, String, String)> for Row {
+    type Error = anyhow::Error;
+
+    fn try_from(value: (u32, String, String)) -> Result<Self, Self::Error> {
+        let (id, username, email) = value;
+
+        let username: [u8; 32] =
+            vector_to_array(username.into()).context("could not parse username")?;
+        let email: [u8; 255] = vector_to_array(email.into()).context("could not parse email")?;
+
+        Ok(Self {
+            id,
+            username,
+            email,
+        })
+    }
 }
 
 impl PartialEq for Row {
@@ -41,10 +81,10 @@ impl PartialEq for Row {
 impl Debug for Row {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let binding = self.username.to_vec();
-        let username = from_utf8(&binding).unwrap();
+        let username = from_utf8(&binding).unwrap().replace('\0', "");
 
         let binding = self.email.to_vec();
-        let email = from_utf8(&binding).unwrap();
+        let email = from_utf8(&binding).unwrap().replace('\0', "");
 
         f.debug_struct("Row")
             .field("id", &self.id)
@@ -91,42 +131,14 @@ impl Row {
     }
 }
 
-const TABLE_MAX_PAGES: usize = 100;
-const PAGE_SIZE: usize = 4096; // 4KB
-const ROWS_PER_PAGE: usize = PAGE_SIZE / ROWS_SIZE;
-const TABLE_MAX_ROWS: usize = ROWS_PER_PAGE * TABLE_MAX_PAGES;
-
 #[derive(Debug, Default)]
-struct Page {
-    rows: Vec<u8>,
-}
-
-impl Page {
-    fn is_full(&self) -> bool {
-        self.rows.len() / ROWS_SIZE >= ROWS_PER_PAGE
-    }
-}
-
-impl<'a> IntoIterator for &'a Page {
-    type Item = &'a [u8];
-    type IntoIter = std::vec::IntoIter<Self::Item>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.rows
-            .chunks(ROWS_SIZE)
-            .collect::<Vec<&[u8]>>()
-            .into_iter()
-    }
-}
-
-#[derive(Debug, Default)]
-struct Table {
+pub struct Table {
     num_rows: usize,
     pages: Vec<Page>,
 }
 
 impl Table {
-    fn insert(&mut self, r: &Row) -> anyhow::Result<()> {
+    pub fn insert(&mut self, r: &Row) -> anyhow::Result<()> {
         if self.pages.len() >= TABLE_MAX_ROWS {
             bail!("table is full")
         }
@@ -150,7 +162,7 @@ impl Table {
         Ok(())
     }
 
-    fn select(&mut self) -> anyhow::Result<()> {
+    pub fn select(&mut self) -> anyhow::Result<()> {
         self.pages.iter().for_each(|page| {
             page.into_iter().for_each(|bytes| {
                 Row::deserialize(bytes).unwrap();
@@ -180,11 +192,29 @@ impl<'a> IntoIterator for &'a Table {
     }
 }
 
+fn vector_to_array<T, const N: usize>(mut v: Vec<T>) -> anyhow::Result<[T; N]>
+where
+    T: Default,
+{
+    let missing = N
+        .checked_sub(v.len())
+        .ok_or_else(|| anyhow!("invalid len of input"))?;
+
+    v.append(&mut (0..missing).map(|_| T::default()).collect());
+
+    let t: Result<[T; N], _> = v.try_into();
+
+    match t {
+        Ok(t) => Ok(t),
+        Err(_) => bail!("could not convert vector to array"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::table::ROWS_SIZE;
 
-    use super::{Row, Table};
+    use super::{vector_to_array, Row, Table};
     use std::io::Write;
 
     #[test]
@@ -199,27 +229,12 @@ mod tests {
         buffer.to_vec()
     }
 
-    use std::convert::TryInto;
-
-    fn demo<T, const N: usize>(mut v: Vec<T>) -> [T; N]
-    where
-        T: Default,
-    {
-        let missing = N - v.len();
-
-        v.append(&mut (0..missing).map(|_| T::default()).collect());
-
-        v.try_into().unwrap_or_else(|v: Vec<T>| {
-            panic!("Expected a Vec of length {} but it was {}", N, v.len())
-        })
-    }
-
     #[test]
     fn test_serialize() {
         let r = Row {
             id: 1,
-            username: demo(str_as_bytes("elo")),
-            email: demo(str_as_bytes("asdasdkpoqkwepoqkwepoqw")),
+            username: vector_to_array(str_as_bytes("elo")).unwrap(),
+            email: vector_to_array(str_as_bytes("asdasdkpoqkwepoqkwepoqw")).unwrap(),
         };
         let b1 = r.serialize();
         let b2 = r.serialize();
@@ -231,8 +246,8 @@ mod tests {
     fn test_deserialize() -> anyhow::Result<()> {
         let r = Row {
             id: 1,
-            username: demo(str_as_bytes("elo")),
-            email: demo(str_as_bytes("asdasdkpoqkwepoqkwepoqw")),
+            username: vector_to_array(str_as_bytes("elo")).unwrap(),
+            email: vector_to_array(str_as_bytes("asdasdkpoqkwepoqkwepoqw")).unwrap(),
         };
         let b1 = r.serialize();
         let b2 = r.serialize();
@@ -247,30 +262,21 @@ mod tests {
     }
 
     #[test]
-    fn test() {
-        let a = [0; 255];
-        let v = a.to_vec();
-
-        assert_eq!(a.len(), 255);
-        assert_eq!(v.len(), 255);
-    }
-
-    #[test]
     fn test_table() -> anyhow::Result<()> {
         let r = Row {
             id: 1,
-            username: demo(str_as_bytes("elo")),
-            email: demo(str_as_bytes("asdasdkpoqkwepoqkwepoqw")),
+            username: vector_to_array(str_as_bytes("a".repeat(32).as_str())).unwrap(),
+            email: vector_to_array(str_as_bytes("a".repeat(255).as_str())).unwrap(),
         };
         let r2 = Row {
             id: 2,
-            username: demo(str_as_bytes("elo2")),
-            email: demo(str_as_bytes("asdasdkpoqkwepoqkwepoqw2")),
+            username: vector_to_array(str_as_bytes("elo2")).unwrap(),
+            email: vector_to_array(str_as_bytes("asdasdkpoqkwepoqkwepoqw2")).unwrap(),
         };
         let r3 = Row {
             id: 3,
-            username: demo(str_as_bytes("elo3")),
-            email: demo(str_as_bytes("asdasdkpoqkwepoqkwepoqw3")),
+            username: vector_to_array(str_as_bytes("elo3")).unwrap(),
+            email: vector_to_array(str_as_bytes("asdasdkpoqkwepoqkwepoqw3")).unwrap(),
         };
         let mut table = Table::default();
         table.insert(&r)?;
