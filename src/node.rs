@@ -2,9 +2,9 @@ use std::{cell::RefCell, rc::Rc};
 
 use crate::{
     constants::{
-        IS_ROOT_OFFSET, LEAF_NODE_HEADER_SIZE, LEAF_NODE_KEY_SIZE, LEAF_NODE_NUM_CELLS_OFFSET,
-        LEAF_NODE_NUM_CELLS_SIZE, NODE_TYPE_OFFSET, PAGE_SIZE, PARENT_POINTER_OFFSET,
-        PARENT_POINTER_SIZE, ROWS_SIZE,
+        IS_ROOT_OFFSET, LEAF_INDEX_NODE_CELL_SIZE, LEAF_NODE_HEADER_SIZE, LEAF_NODE_KEY_SIZE,
+        LEAF_NODE_NUM_CELLS_OFFSET, LEAF_NODE_NUM_CELLS_SIZE, NODE_TYPE_OFFSET, PAGE_SIZE,
+        PARENT_POINTER_OFFSET, PARENT_POINTER_SIZE, ROWS_SIZE,
     },
     pager::{Page, Pager},
 };
@@ -29,6 +29,90 @@ impl From<u32> for Key {
 }
 
 #[derive(Debug, Clone)]
+pub enum InternalNodeType {
+    /// Internal nodes contain a vector of pointers to their children and a vector of keys.
+    Internal {
+        right_child: Pointer,
+        child_pointer_pairs: Vec<(Pointer, Key)>,
+        is_index: bool,
+    },
+
+    Leaf {
+        /// Key - Value vector of serialized data. Key is Row's ID field value.
+        kvs: Vec<(Key, Vec<u8>)>,
+
+        /// Optional pointer to right next leaf. Enables robust select;
+        next_leaf: Option<Pointer>,
+
+        is_index: bool,
+    },
+}
+
+/// The one-byte flag at offset 0 indicating the b-tree page type.
+///     * A value of 2 (0x02) means the page is an interior index b-tree page.
+///     * A value of 5 (0x05) means the page is an interior table b-tree page.
+///     * A value of 10 (0x0a) means the page is a leaf index b-tree page.
+///     * A value of 13 (0x0d) means the page is a leaf table b-tree page.
+impl TryFrom<u8> for InternalNodeType {
+    type Error = anyhow::Error;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        Ok(match value {
+            0x02 => Self::Internal {
+                right_child: Pointer(0),
+                child_pointer_pairs: Vec::new(),
+                is_index: true,
+            },
+            0x05 => Self::Internal {
+                right_child: Pointer(0),
+                child_pointer_pairs: Vec::new(),
+                is_index: true,
+            },
+            0x0a => Self::Leaf {
+                kvs: vec![],
+                next_leaf: None,
+                is_index: true,
+            },
+            0x0d => Self::Leaf {
+                kvs: vec![],
+                next_leaf: None,
+                is_index: false,
+            },
+            _ => bail!("invalid node type: {}", value),
+        })
+    }
+}
+
+impl From<&InternalNodeType> for u8 {
+    fn from(val: &InternalNodeType) -> Self {
+        match val {
+            InternalNodeType::Internal {
+                right_child: _,
+                child_pointer_pairs: _,
+                is_index,
+            } => {
+                if *is_index {
+                    0x02
+                } else {
+                    0x05
+                }
+            }
+            InternalNodeType::Leaf {
+                kvs: _,
+                next_leaf: _,
+                is_index,
+            } => {
+                if *is_index {
+                    0x0a
+                } else {
+                    0x0d
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub enum NodeType {
     /// Internal nodes contain a vector of pointers to their children and a vector of keys.
     Internal {
@@ -43,54 +127,49 @@ pub enum NodeType {
         /// Optional pointer to right next leaf. Enables robust select;
         next_leaf: Option<Pointer>,
     },
-    // TODO add index leaf
-}
-
-impl TryFrom<u8> for NodeType {
-    type Error = anyhow::Error;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        Ok(match value {
-            0x00 => NodeType::Leaf {
-                kvs: vec![],
-                next_leaf: None,
-            },
-            0x01 => Self::Internal {
-                right_child: Pointer(0),
-                child_pointer_pairs: Vec::new(),
-            },
-            _ => bail!("invalid node type: {}", value),
-        })
-    }
-}
-
-impl From<&NodeType> for u8 {
-    fn from(val: &NodeType) -> Self {
-        match val {
-            NodeType::Leaf {
-                kvs: _,
-                next_leaf: _,
-            } => 0x00,
-            NodeType::Internal {
-                right_child: _,
-                child_pointer_pairs: _,
-            } => 0x01,
-        }
-    }
 }
 
 #[derive(Debug)]
 pub struct Node {
     pub node_type: NodeType,
     pub is_root: bool,
+    pub is_index: bool,
     pub parent: Option<u32>, // parent offset
 }
 
+impl From<&Node> for u8 {
+    fn from(val: &Node) -> Self {
+        match val.node_type {
+            NodeType::Internal {
+                right_child: _,
+                child_pointer_pairs: _,
+            } => {
+                if val.is_index {
+                    0x02
+                } else {
+                    0x05
+                }
+            }
+            NodeType::Leaf {
+                kvs: _,
+                next_leaf: _,
+            } => {
+                if val.is_index {
+                    0x0a
+                } else {
+                    0x0d
+                }
+            }
+        }
+    }
+}
+
 impl Node {
-    pub fn new(node_type: NodeType, is_root: bool, parent: Option<u32>) -> Self {
+    pub fn new(node_type: NodeType, is_root: bool, is_index: bool, parent: Option<u32>) -> Self {
         Self {
             node_type,
             is_root,
+            is_index,
             parent,
         }
     }
@@ -286,8 +365,8 @@ impl TryFrom<Page> for Node {
     fn try_from(value: Page) -> anyhow::Result<Self, Self::Error> {
         let data = value.data;
 
-        let node_type =
-            NodeType::try_from(data[NODE_TYPE_OFFSET]).context("could not parse NodeType")?;
+        let node_type = InternalNodeType::try_from(data[NODE_TYPE_OFFSET])
+            .context("could not parse NodeType")?;
         let is_root: bool = data[IS_ROOT_OFFSET] == 1;
         let parent: Option<u32> = if is_root {
             None
@@ -302,9 +381,10 @@ impl TryFrom<Page> for Node {
 
         let mut offset = LEAF_NODE_HEADER_SIZE;
         match node_type {
-            NodeType::Internal {
+            InternalNodeType::Internal {
                 mut right_child,
                 mut child_pointer_pairs,
+                is_index,
             } => {
                 right_child = Pointer(
                     pointer_from_bytes(&data, offset).context("could not right_child pointer")?,
@@ -329,12 +409,14 @@ impl TryFrom<Page> for Node {
                         child_pointer_pairs,
                     },
                     is_root,
+                    is_index,
                     parent,
                 ))
             }
-            NodeType::Leaf {
+            InternalNodeType::Leaf {
                 mut kvs,
                 mut next_leaf,
+                is_index,
             } => {
                 next_leaf =
                     match pointer_from_bytes(&data, offset).context("could not parse next_leaf")? {
@@ -343,17 +425,24 @@ impl TryFrom<Page> for Node {
                     };
 
                 offset += LEAF_NODE_KEY_SIZE;
+
+                let row_size = if is_index {
+                    LEAF_INDEX_NODE_CELL_SIZE
+                } else {
+                    ROWS_SIZE
+                };
                 for _ in 0..num_cells {
                     let key = pointer_from_bytes(&data, offset).context("could not parse key")?;
                     offset += LEAF_NODE_KEY_SIZE;
-                    let data = value.get_ptr_from_offset(offset, ROWS_SIZE);
-                    offset += ROWS_SIZE;
+                    let data = value.get_ptr_from_offset(offset, row_size);
+                    offset += row_size;
                     kvs.push((Key(key), data.to_vec()));
                 }
 
                 Ok(Self::new(
                     NodeType::Leaf { kvs, next_leaf },
                     is_root,
+                    is_index,
                     parent,
                 ))
             }
@@ -375,7 +464,7 @@ impl TryFrom<Node> for [u8; PAGE_SIZE] {
     fn try_from(val: Node) -> anyhow::Result<Self, Self::Error> {
         let mut buf = [0u8; PAGE_SIZE];
 
-        buf[NODE_TYPE_OFFSET] = (&val.node_type).into();
+        buf[NODE_TYPE_OFFSET] = (&val).into();
         buf[IS_ROOT_OFFSET] = val.is_root.into();
         buf[PARENT_POINTER_OFFSET..PARENT_POINTER_OFFSET + PARENT_POINTER_SIZE]
             .copy_from_slice(&val.parent.unwrap_or_default().to_be_bytes());
@@ -406,11 +495,18 @@ impl TryFrom<Node> for [u8; PAGE_SIZE] {
                 buf[offset..offset + LEAF_NODE_KEY_SIZE]
                     .copy_from_slice(&next_leaf.unwrap_or_default().0.to_be_bytes());
                 offset += LEAF_NODE_KEY_SIZE;
-                for (k, v) in kvs {
-                    buf[offset..offset + LEAF_NODE_KEY_SIZE].copy_from_slice(&k.0.to_be_bytes());
+
+                let row_size = if val.is_index {
+                    LEAF_INDEX_NODE_CELL_SIZE
+                } else {
+                    ROWS_SIZE
+                };
+
+                for (Key(key), v) in kvs {
+                    buf[offset..offset + LEAF_NODE_KEY_SIZE].copy_from_slice(&key.to_be_bytes());
                     offset += LEAF_NODE_KEY_SIZE;
-                    buf[offset..offset + ROWS_SIZE].copy_from_slice(&v);
-                    offset += ROWS_SIZE;
+                    buf[offset..offset + row_size].copy_from_slice(&v);
+                    offset += row_size;
                 }
             }
         }

@@ -157,16 +157,14 @@ impl Serialize for RowID {
         buffer.append(&mut self.page_num.to_be_bytes().to_vec());
         buffer.append(&mut self.cell_num.to_be_bytes().to_vec());
 
-        buffer.append(&mut vec![0u8; ROWS_SIZE - buffer.len()]);
-
         buffer
     }
 }
 
 impl Deserialize for RowID {
     fn deserialize(data: &[u8]) -> anyhow::Result<Self> {
-        let page_num_bytes = &data[ID_OFFSET..ID_SIZE];
-        let cell_num_bytes = &data[ID_OFFSET + ID_SIZE..ID_SIZE];
+        let page_num_bytes = &data[0..4];
+        let cell_num_bytes = &data[4..8];
 
         let page_num: u32 = u32::from_be_bytes(
             page_num_bytes
@@ -200,16 +198,30 @@ impl<K, V> Table<K, V> {
             // new database, need to initialize
             {
                 let root = pager.get_page(0)?;
-                let mut node = Node::try_from(root.borrow().clone())?;
-                node.is_root = true;
+                let node = Node::new(
+                    NodeType::Leaf {
+                        kvs: vec![],
+                        next_leaf: None,
+                    },
+                    true,
+                    false,
+                    None,
+                );
                 root.borrow_mut().data = node.try_into()?;
             }
 
             {
                 let index_root = pager.get_page(1)?;
-                let mut index_node = Node::try_from(index_root.borrow().clone())?;
-                index_node.is_root = true;
-                index_root.borrow_mut().data = index_node.try_into()?;
+                let node = Node::new(
+                    NodeType::Leaf {
+                        kvs: vec![],
+                        next_leaf: None,
+                    },
+                    true,
+                    true,
+                    None,
+                );
+                index_root.borrow_mut().data = node.try_into()?;
             }
         }
 
@@ -235,8 +247,8 @@ impl<K, V> Table<K, V> {
                         page_num,
                         cell_num: cell_num as u32,
                     };
-                    self.cursor_find(self.root_index_num, key)?
-                        .insert(key, &row_id.serialize())?;
+                    let cursor = self.cursor_find(self.root_index_num, key)?;
+                    cursor.insert(key, &row_id.serialize())?;
                 }
             }
         }
@@ -314,9 +326,16 @@ where
 {
     /// Searches for particular saved row.
     pub fn search(&mut self, id: u32) -> anyhow::Result<Option<V>> {
-        let cursor = self.cursor_find(self.root_index_num, id)?;
+        let index_cursor = self.cursor_find(self.root_index_num, id)?;
+        let row_cursor = match index_cursor.data()? {
+            Some(data) => {
+                let index = RowID::deserialize(&data)?;
+                Cursor::new(self.pager.clone(), index.page_num, index.cell_num)
+            }
+            None => self.cursor_find(self.root_page_num, id)?,
+        };
 
-        Ok(match cursor.data()? {
+        Ok(match row_cursor.data()? {
             Some(data) => Some(V::deserialize(&data)?),
             None => None,
         })
@@ -345,8 +364,9 @@ where
                 child_pointer_pairs,
             } => {
                 println!(
-                    "{ident}({page_num}) internal [root: {}, parent: {}] ({:?}, key {:?})",
+                    "{ident}({page_num}) internal [root: {}, inx: {}, parent: {}] ({:?}, key {:?})",
                     node.is_root,
+                    node.is_index,
                     node.parent.map(|x| x.to_string()).unwrap_or_default(),
                     child_pointer_pairs
                         .iter()
@@ -360,12 +380,23 @@ where
                 self.print(right_child.0, format!(" {}", ident))?;
             }
             NodeType::Leaf { kvs, next_leaf } => {
-                println!(
-                    "{ident}({page_num}) leaf: [parent: {}](kvs: {:?}, next_leaf: {:?})",
-                    node.parent.map(|x| x.to_string()).unwrap_or_default(),
-                    kvs.iter().map(|(key, _)| key.0).collect::<Vec<u32>>(),
-                    next_leaf,
-                )
+                if node.is_index {
+                    println!(
+                        "{ident}({page_num}) leaf: [parent: {}, inx: {}](kvs: {:?}, next_leaf: {:?})",
+                        node.parent.map(|x| x.to_string()).unwrap_or_default(),
+                        node.is_index,
+                        kvs.iter().map(|(Key(key), data)| (key, RowID::deserialize(data).unwrap())).map(|(key, row_id)| format!("{} -> ({}, {})", key, row_id.page_num, row_id.cell_num)).collect::<Vec<String>>(),
+                        next_leaf,
+                    )
+                } else {
+                    println!(
+                        "{ident}({page_num}) leaf: [parent: {}, inx: {}](kvs: {:?}, next_leaf: {:?})",
+                        node.parent.map(|x| x.to_string()).unwrap_or_default(),
+                        node.is_index,
+                        kvs.iter().map(|(key, _)| key.0).collect::<Vec<u32>>(),
+                        next_leaf,
+                    )
+                }
             }
         }
         Ok(())
@@ -422,9 +453,7 @@ where
                         .insert(key, &row_id.serialize())?;
                 }
             }
-            OperationInfo::Replace => {
-                dbg!(key, "replace occurred");
-            }
+            OperationInfo::Replace => {}
         }
 
         Ok(())

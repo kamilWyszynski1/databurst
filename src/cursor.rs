@@ -3,7 +3,7 @@ use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 use anyhow::{bail, Context, Ok};
 
 use crate::{
-    constants::LEAF_NODE_MAX_CELLS,
+    constants::{LEAF_INDEX_NODE_MAX_CELLS, LEAF_NODE_MAX_CELLS},
     node::{Key, Node, NodeType, Pointer},
     pager::Pager,
     table::RowID,
@@ -22,11 +22,19 @@ pub enum OperationInfo {
     Replace,
 }
 
-#[derive(Debug)]
 pub struct Cursor {
     pager: Rc<RefCell<Pager>>,
     pub page_num: u32,
     pub cell_num: u32,
+}
+
+impl std::fmt::Debug for Cursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Cursor")
+            .field("page_num", &self.page_num)
+            .field("cell_num", &self.cell_num)
+            .finish()
+    }
 }
 
 impl Cursor {
@@ -45,13 +53,10 @@ impl Cursor {
         let mut node = Node::try_from(page.borrow().clone())?;
 
         // check if cell_num is already occupied, if key matches, replace value
-        if let NodeType::Leaf {
-            mut kvs,
-            next_leaf: _,
-        } = node.node_type.clone()
-        {
+        if let NodeType::Leaf { kvs, next_leaf: _ } = &mut node.node_type {
             if let Some((Key(existing_key), existing_data)) = kvs.get_mut(self.cell_num as usize) {
                 if *existing_key == key {
+                    println!("replace");
                     // replace and return
                     *existing_data = data.to_vec();
                     // turn node back into bytes
@@ -61,8 +66,12 @@ impl Cursor {
             }
         }
 
+        let num_cells = node.num_cells() as usize;
+
         // check if split is needed
-        if node.num_cells() as usize >= LEAF_NODE_MAX_CELLS {
+        if (node.is_index && num_cells >= LEAF_INDEX_NODE_MAX_CELLS)
+            || (!node.is_index && num_cells >= LEAF_NODE_MAX_CELLS)
+        {
             let metadata = self.leaf_node_split_and_insert(key, data)?;
             return Ok(OperationInfo::Insert {
                 split_occurred: true,
@@ -104,9 +113,10 @@ impl Cursor {
         let left_node = Node::try_from(left_page.clone())?;
 
         let right_page_num = self.pager.borrow().get_unused_page_num();
-        self.pager.borrow_mut().get_page(right_page_num)?; // alocate page
+        self.pager.borrow_mut().get_page(right_page_num)?; // allocate page
 
         let is_root = left_node.is_root;
+        let is_index = left_node.is_index;
 
         {
             // All existing keys plus new key should be divided evenly between old (left) and new (right) nodes.
@@ -120,6 +130,7 @@ impl Cursor {
                         next_leaf: Some(Pointer(right_page_num)),
                     },
                     false,
+                    is_index,
                     left_node.parent,
                 );
                 let mut right_node = Node::new(
@@ -128,6 +139,7 @@ impl Cursor {
                         next_leaf,
                     },
                     false,
+                    is_index,
                     left_node.parent,
                 );
 
@@ -149,6 +161,7 @@ impl Cursor {
                             )],
                         },
                         true,
+                        is_index,
                         None,
                     );
                     left_page.borrow_mut().data = root.try_into()?; // rewrite root
@@ -174,30 +187,6 @@ impl Cursor {
             }
         }
 
-        // let left_child_max_key = Node::try_from(left_page.clone())?.max_key();
-        // if left_node.is_root {
-        //     // root page has to stay as it was, because of that we need to allocate another page
-        //     // copy content and change that page data
-        //     left_page_num = self.pager.borrow().get_unused_page_num();
-        //     let new_left_page = self.pager.borrow_mut().get_page(left_page_num)?;
-        //     new_left_page.borrow_mut().data = left_page.borrow().data; // clone data
-
-        //     // split the root
-        //     let root = Node::new(
-        //         NodeType::Internal {
-        //             right_child: Pointer(right_page_num),
-        //             child_pointer_pairs: vec![(Pointer(left_page_num), left_child_max_key.into())],
-        //         },
-        //         true,
-        //         None,
-        //     );
-        //     left_page.borrow_mut().data = root.try_into()?; // rewrite root
-        // } else {
-        //     // update leaf's parent
-        //     let page_num = left_node.parent.context("no parent")?;
-        //     self.insert_into_internal(page_num, right_page_num, left_child_max_key)?;
-        // }
-
         Ok(SplitMetadata {
             new_left: left_page_num,
             new_right: right_page_num,
@@ -217,6 +206,7 @@ impl Cursor {
     ) -> anyhow::Result<()> {
         let page = self.pager.borrow_mut().get_page(page_num)?;
         let node = Node::try_from(page.clone())?;
+        let is_index = node.is_index;
 
         match node.node_type {
             NodeType::Internal {
@@ -224,7 +214,9 @@ impl Cursor {
                 mut child_pointer_pairs,
             } => {
                 let pointers_len = child_pointer_pairs.len();
-                if pointers_len == LEAF_NODE_MAX_CELLS {
+                if (is_index && pointers_len == LEAF_INDEX_NODE_MAX_CELLS)
+                    || (!is_index && pointers_len == LEAF_NODE_MAX_CELLS)
+                {
                     // find place to insert key
                     let inx = child_pointer_pairs
                         .binary_search_by_key(&key, |(_, Key(key))| *key)
@@ -250,6 +242,7 @@ impl Cursor {
                                 child_pointer_pairs: siblings,
                             },
                             false,
+                            is_index,
                             node.parent,
                         );
                         new_node.update_children_parent(new_page_num, self.pager.clone())?;
@@ -263,6 +256,7 @@ impl Cursor {
                                 child_pointer_pairs,
                             },
                             false,
+                            is_index,
                             node.parent,
                         );
                         node.update_children_parent(page_num, self.pager.clone())?;
@@ -300,6 +294,7 @@ impl Cursor {
                                 )],
                             },
                             true,
+                            is_index,
                             None,
                         );
                         page.borrow_mut().data = root.try_into()?;
@@ -337,6 +332,7 @@ impl Cursor {
                             child_pointer_pairs,
                         },
                         node.is_root,
+                        is_index,
                         node.parent,
                     )
                     .try_into()?;
@@ -471,6 +467,7 @@ mod test {
                 child_pointer_pairs: vec![(Pointer(0), Key(1))],
             },
             true,
+            false,
             None,
         );
 
@@ -494,6 +491,7 @@ mod test {
                 next_leaf: Some(Pointer(2)),
             },
             false,
+            false,
             Some(0),
         );
         let node_2 = Node::new(
@@ -501,6 +499,7 @@ mod test {
                 kvs: vec![],
                 next_leaf: None,
             },
+            false,
             false,
             Some(0),
         );
