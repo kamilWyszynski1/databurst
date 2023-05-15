@@ -11,6 +11,7 @@ mod constants;
 mod cursor;
 mod node;
 mod pager;
+mod row;
 mod table;
 
 fn main() -> anyhow::Result<()> {

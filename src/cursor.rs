@@ -13,6 +13,7 @@ pub struct SplitMetadata {
     pub new_left: u32,
     pub new_right: u32,
 }
+
 /// Metadata about various, database operations.
 pub enum OperationInfo {
     Insert {
