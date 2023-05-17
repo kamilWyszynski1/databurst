@@ -16,12 +16,14 @@ use std::{
 #[derive(Debug, Clone)]
 pub struct Page {
     pub data: [u8; PAGE_SIZE],
+    pub row_size: usize,
 }
 
 impl Page {
-    pub fn default() -> Self {
+    pub fn new(row_size: usize) -> Self {
         Self {
             data: [0; PAGE_SIZE],
+            row_size,
         }
     }
 
@@ -40,6 +42,7 @@ impl TryFrom<Node> for Page {
 
     fn try_from(value: Node) -> anyhow::Result<Self, Self::Error> {
         Ok(Self {
+            row_size: value.row_size,
             data: value.try_into()?,
         })
     }
@@ -51,10 +54,12 @@ pub struct Pager {
     pub file_len: u32,
     pub num_pages: u32,
     pub pages_rc: [Option<Rc<RefCell<Page>>>; TABLE_MAX_PAGES],
+
+    row_size: usize,
 }
 
 impl Pager {
-    pub fn new<P: AsRef<Path>>(p: P) -> anyhow::Result<Self> {
+    pub fn new<P: AsRef<Path>>(p: P, row_size: usize) -> anyhow::Result<Self> {
         let f = OpenOptions::new()
             .write(true)
             .read(true)
@@ -76,6 +81,7 @@ impl Pager {
             file_len,
             num_pages,
             pages_rc: [INIT; TABLE_MAX_PAGES],
+            row_size,
         })
     }
 
@@ -118,12 +124,12 @@ impl Pager {
             reader.take(PAGE_SIZE as u64).read_to_end(&mut buf)?;
 
             // let's split page into chunks
-            let mut page = Page::default();
+            let mut page = Page::new(self.row_size);
             page.data = vector_to_array(buf)?;
 
             page
         } else {
-            Page::default()
+            Page::new(self.row_size)
         };
 
         let p = Rc::new(RefCell::new(page));

@@ -109,8 +109,11 @@ impl Cursor {
         data: &[u8],
     ) -> anyhow::Result<SplitMetadata> {
         let mut left_page_num = self.page_num;
+
         let left_page = self.pager.borrow_mut().get_page(left_page_num)?;
         let left_node = Node::try_from(left_page.clone())?;
+
+        let row_size = left_node.row_size;
 
         let right_page_num = self.pager.borrow().get_unused_page_num();
         self.pager.borrow_mut().get_page(right_page_num)?; // allocate page
@@ -132,6 +135,7 @@ impl Cursor {
                     false,
                     is_index,
                     left_node.parent,
+                    row_size,
                 );
                 let mut right_node = Node::new(
                     NodeType::Leaf {
@@ -141,6 +145,7 @@ impl Cursor {
                     false,
                     is_index,
                     left_node.parent,
+                    row_size,
                 );
 
                 let left_child_max_key = left_node.max_key();
@@ -163,6 +168,7 @@ impl Cursor {
                         true,
                         is_index,
                         None,
+                        row_size,
                     );
                     left_page.borrow_mut().data = root.try_into()?; // rewrite root
 
@@ -208,6 +214,8 @@ impl Cursor {
         let node = Node::try_from(page.clone())?;
         let is_index = node.is_index;
 
+        let row_size = node.row_size;
+
         match node.node_type {
             NodeType::Internal {
                 mut right_child,
@@ -244,6 +252,7 @@ impl Cursor {
                             false,
                             is_index,
                             node.parent,
+                            row_size,
                         );
                         new_node.update_children_parent(new_page_num, self.pager.clone())?;
                         new_page.borrow_mut().data = new_node.try_into()?;
@@ -258,6 +267,7 @@ impl Cursor {
                             false,
                             is_index,
                             node.parent,
+                            row_size,
                         );
                         node.update_children_parent(page_num, self.pager.clone())?;
                         page.borrow_mut().data = node.try_into()?;
@@ -296,6 +306,7 @@ impl Cursor {
                             true,
                             is_index,
                             None,
+                            row_size,
                         );
                         page.borrow_mut().data = root.try_into()?;
                     } else {
@@ -334,6 +345,7 @@ impl Cursor {
                         node.is_root,
                         is_index,
                         node.parent,
+                        row_size,
                     )
                     .try_into()?;
                 }
@@ -455,11 +467,12 @@ mod test {
         let file_path = tmp_dir.path().join("my.db");
         let _f = File::create(&file_path)?;
 
-        let mut pager = Pager::new(file_path)?;
-        pager.num_pages = 3;
-
         let row_bytes =
             Row::try_from((1, "username".to_string(), "email".to_string()))?.serialize();
+        let row_size = row_bytes.len();
+
+        let mut pager = Pager::new(file_path, row_size)?;
+        pager.num_pages = 3;
 
         let root = Node::new(
             NodeType::Internal {
@@ -469,6 +482,7 @@ mod test {
             true,
             false,
             None,
+            row_size,
         );
 
         let node_1 = Node::new(
@@ -493,6 +507,7 @@ mod test {
             false,
             false,
             Some(0),
+            row_size,
         );
         let node_2 = Node::new(
             NodeType::Leaf {
@@ -502,6 +517,7 @@ mod test {
             false,
             false,
             Some(0),
+            row_size,
         );
 
         let page_1 = Rc::new(RefCell::new(Page::try_from(node_1)?));

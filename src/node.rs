@@ -135,6 +135,8 @@ pub struct Node {
     pub is_root: bool,
     pub is_index: bool,
     pub parent: Option<u32>, // parent offset
+
+    pub row_size: usize,
 }
 
 impl From<&Node> for u8 {
@@ -165,12 +167,19 @@ impl From<&Node> for u8 {
 }
 
 impl Node {
-    pub fn new(node_type: NodeType, is_root: bool, is_index: bool, parent: Option<u32>) -> Self {
+    pub fn new(
+        node_type: NodeType,
+        is_root: bool,
+        is_index: bool,
+        parent: Option<u32>,
+        row_size: usize,
+    ) -> Self {
         Self {
             node_type,
             is_root,
             is_index,
             parent,
+            row_size,
         }
     }
 
@@ -411,6 +420,7 @@ impl TryFrom<Page> for Node {
                     is_root,
                     is_index,
                     parent,
+                    value.row_size,
                 ))
             }
             InternalNodeType::Leaf {
@@ -429,7 +439,7 @@ impl TryFrom<Page> for Node {
                 let row_size = if is_index {
                     LEAF_INDEX_NODE_CELL_SIZE
                 } else {
-                    ROWS_SIZE
+                    value.row_size
                 };
                 for _ in 0..num_cells {
                     let key = pointer_from_bytes(&data, offset).context("could not parse key")?;
@@ -444,6 +454,7 @@ impl TryFrom<Page> for Node {
                     is_root,
                     is_index,
                     parent,
+                    value.row_size,
                 ))
             }
         }
@@ -499,7 +510,7 @@ impl TryFrom<Node> for [u8; PAGE_SIZE] {
                 let row_size = if val.is_index {
                     LEAF_INDEX_NODE_CELL_SIZE
                 } else {
-                    ROWS_SIZE
+                    val.row_size
                 };
 
                 for (Key(key), v) in kvs {

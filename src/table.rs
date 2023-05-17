@@ -36,8 +36,20 @@ pub trait Serialize {
     fn serialize(&self) -> Vec<u8>;
 }
 
+impl Serialize for Vec<u8> {
+    fn serialize(&self) -> Vec<u8> {
+        self.clone()
+    }
+}
+
 pub trait Deserialize: Sized {
     fn deserialize(data: &[u8]) -> anyhow::Result<Self>;
+}
+
+impl Deserialize for Vec<u8> {
+    fn deserialize(data: &[u8]) -> anyhow::Result<Self> {
+        Ok(data.to_vec())
+    }
 }
 
 #[derive(PartialOrd, Clone)]
@@ -202,6 +214,7 @@ pub struct Table<K, V> {
     pub pager: Rc<RefCell<Pager>>,
 
     /// Describes table's schema.
+    //TODO: add in constructor and validate if definition has 'id' column.
     pub table_definition: Option<TableDefinition>,
 
     marker: PhantomData<(K, V)>,
@@ -209,7 +222,7 @@ pub struct Table<K, V> {
 
 impl<K, V> Table<K, V> {
     pub fn db_open<P: AsRef<Path>>(p: P) -> anyhow::Result<Self> {
-        let mut pager = Pager::new(p)?;
+        let mut pager = Pager::new(p, ROWS_SIZE)?;
 
         if pager.num_pages == 0 {
             // new database, need to initialize
@@ -223,6 +236,7 @@ impl<K, V> Table<K, V> {
                     true,
                     false,
                     None,
+                    ROWS_SIZE,
                 );
                 root.borrow_mut().data = node.try_into()?;
             }
@@ -237,6 +251,7 @@ impl<K, V> Table<K, V> {
                     true,
                     true,
                     None,
+                    ROWS_SIZE,
                 );
                 index_root.borrow_mut().data = node.try_into()?;
             }
@@ -450,7 +465,12 @@ where
             column_type: _,
         } in self.table_definition.clone().unwrap().columns
         {
-            data.append(&mut values.get(&name).unwrap().clone())
+            data.append(
+                &mut values
+                    .get(&name)
+                    .with_context(|| format!("missing '{}' column value", name))?
+                    .clone(),
+            )
         }
 
         // ===== INSERT DATA ===== //
@@ -567,7 +587,7 @@ mod tests {
         row::{Column, ColumnType, TableDefinition},
         table::{Deserialize, Serialize},
     };
-    use std::{fs::File, io::Write};
+    use std::{collections::HashMap, fs::File, io::Write};
 
     pub fn str_as_bytes(s: &str) -> Vec<u8> {
         let mut buffer = vec![];
@@ -774,6 +794,90 @@ mod tests {
 
         let db2: Table<u32, Row> = Table::db_open(&file_path)?;
         assert_eq!(td, db2.table_definition.unwrap());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_table_invalid_insert() -> anyhow::Result<()> {
+        let tmp_dir = TempDir::new("databurst")?;
+        let file_path = tmp_dir.path().join("my.db");
+        dbg!(&file_path);
+        File::create(&file_path)?;
+
+        let td = TableDefinition {
+            name: "test".to_string(),
+            columns: vec![Column::new("column", ColumnType::Integer)?],
+        };
+
+        let mut db: Table<u32, Row> = Table::db_open(&file_path)?;
+        db.table_definition = Some(td);
+
+        let err = db.insert(HashMap::from([("lol".to_string(), vec![0u8, 14u8])]));
+
+        assert_eq!(
+            "lol key not found in table definition".to_string(),
+            err.err().unwrap().to_string()
+        );
+
+        assert_eq!(
+            "every table has to have 'id' column".to_string(),
+            db.insert(HashMap::from([(
+                "column".to_string(),
+                vec![0u8, 14u8, 14u8, 14u8],
+            )]))
+            .err()
+            .unwrap()
+            .to_string()
+        );
+
+        db.table_definition = Some(TableDefinition {
+            name: "test".to_string(),
+            columns: vec![
+                Column::new("id", ColumnType::Integer)?,
+                Column::new("column", ColumnType::Integer)?,
+            ],
+        });
+
+        assert_eq!(
+            "missing 'column' column value".to_string(),
+            db.insert(HashMap::from([(
+                "id".to_string(),
+                vec![0u8, 14u8, 14u8, 14u8],
+            )]))
+            .err()
+            .unwrap()
+            .to_string()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_insert_generic_row() -> anyhow::Result<()> {
+        let tmp_dir = TempDir::new("databurst")?;
+        let file_path = tmp_dir.path().join("my.db");
+        dbg!(&file_path);
+        File::create(&file_path)?;
+
+        let td = TableDefinition {
+            name: "test".to_string(),
+            columns: vec![
+                Column::new("id", ColumnType::Integer)?,
+                Column::new("text", ColumnType::Text { size: 32 })?,
+            ],
+        };
+
+        let mut db: Table<u32, Vec<u8>> = Table::db_open(&file_path)?;
+        db.table_definition = Some(td);
+
+        let text = "lorem ipsum";
+        db.insert(HashMap::from([
+            ("id".to_string(), vec![0u8, 0u8, 0u8, 1u8]),
+            ("text".to_string(), text.as_bytes().to_vec()),
+        ]))?;
+
+        let data = db.search(1)?.unwrap();
+        dbg!(data);
 
         Ok(())
     }
