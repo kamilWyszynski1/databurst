@@ -1,11 +1,15 @@
 use anyhow::{anyhow, bail, Context};
-use std::{cell::RefCell, fmt::Debug, marker::PhantomData, path::Path, rc::Rc, str::from_utf8};
+use std::{
+    cell::RefCell, collections::HashMap, fmt::Debug, marker::PhantomData, path::Path, rc::Rc,
+    str::from_utf8,
+};
 
 use crate::{
     constants::{EMAIL_OFFSET, ID_OFFSET, ROWS_SIZE, USERNAME_OFFSET},
     cursor::{Cursor, OperationInfo},
     node::{Key, Node, NodeType},
     pager::Pager,
+    row::{Column, ColumnType, TableDefinition},
 };
 
 macro_rules! field_size {
@@ -40,7 +44,17 @@ pub trait Deserialize: Sized {
 pub struct Row {
     pub id: u32,
     pub username: [u8; 32],
-    pub email: [u8; 255],
+    pub email: [u8; 240],
+}
+
+impl From<Row> for HashMap<String, Vec<u8>> {
+    fn from(val: Row) -> Self {
+        HashMap::from([
+            ("id".to_string(), val.id.to_be_bytes().to_vec()),
+            ("username".to_string(), val.username.to_vec()),
+            ("email".to_string(), val.email.to_vec()),
+        ])
+    }
 }
 
 impl TryFrom<Vec<&str>> for Row {
@@ -54,7 +68,7 @@ impl TryFrom<Vec<&str>> for Row {
         let id: u32 = value[0].parse().context("could not parse id")?;
         let username: [u8; 32] =
             vector_to_array(value[1].into()).context("could not parse username")?;
-        let email: [u8; 255] = vector_to_array(value[2].into()).context("could not parse email")?;
+        let email: [u8; 240] = vector_to_array(value[2].into()).context("could not parse email")?;
 
         Ok(Self {
             id,
@@ -72,7 +86,7 @@ impl TryFrom<(u32, String, String)> for Row {
 
         let username: [u8; 32] =
             vector_to_array(username.into()).context("could not parse username")?;
-        let email: [u8; 255] = vector_to_array(email.into()).context("could not parse email")?;
+        let email: [u8; 240] = vector_to_array(email.into()).context("could not parse email")?;
 
         Ok(Self {
             id,
@@ -187,6 +201,9 @@ pub struct Table<K, V> {
     pub root_index_num: u32,
     pub pager: Rc<RefCell<Pager>>,
 
+    /// Describes table's schema.
+    pub table_definition: Option<TableDefinition>,
+
     marker: PhantomData<(K, V)>,
 }
 
@@ -225,11 +242,14 @@ impl<K, V> Table<K, V> {
             }
         }
 
+        let table_definition = pager.read_table_definition()?;
+
         Ok(Self {
             root_page_num: 0,
             root_index_num: 1,
             pager: Rc::new(RefCell::new(pager)),
             marker: PhantomData,
+            table_definition,
         })
     }
 
@@ -257,7 +277,10 @@ impl<K, V> Table<K, V> {
 
     /// Consumes Table and saves all content to file.
     pub fn close(self) -> anyhow::Result<()> {
-        Rc::try_unwrap(self.pager).unwrap().into_inner().flush()
+        Rc::try_unwrap(self.pager)
+            .unwrap()
+            .into_inner()
+            .flush(self.table_definition)
     }
 
     pub fn cursor_start(&mut self) -> anyhow::Result<Cursor> {
@@ -408,9 +431,29 @@ where
     V: Serialize,
 {
     /// Inserts new row.
-    pub fn insert(&mut self, key: u32, value: V) -> anyhow::Result<()> {
-        let data = value.serialize();
+    pub fn insert(&mut self, values: HashMap<String, Vec<u8>>) -> anyhow::Result<()> {
+        // ===== CHECK DATA ===== //
+        self.check_data_type_coercion(&values)?;
 
+        let key = {
+            let id_value: Vec<u8> = values
+                .get("id")
+                .context("every table has to have 'id' column")?
+                .clone();
+            u32::from_be_bytes(id_value[0..4].try_into()?)
+        };
+
+        // ===== PREPARE DATA ===== //
+        let mut data = vec![];
+        for Column {
+            name,
+            column_type: _,
+        } in self.table_definition.clone().unwrap().columns
+        {
+            data.append(&mut values.get(&name).unwrap().clone())
+        }
+
+        // ===== INSERT DATA ===== //
         let page = self
             .pager
             .borrow_mut()
@@ -458,6 +501,42 @@ where
 
         Ok(())
     }
+
+    /// Checks mapping with table definition and verifies if type casting can be performed.
+    fn check_data_type_coercion(&self, values: &HashMap<String, Vec<u8>>) -> anyhow::Result<()> {
+        let td = self.table_definition.clone().unwrap();
+
+        let columns: HashMap<String, ColumnType> = td
+            .columns
+            .into_iter()
+            .map(|c| (c.name, c.column_type))
+            .collect();
+
+        for (k, value) in values.iter() {
+            let column_type = columns
+                .get(k)
+                .with_context(|| format!("{} key not found in table definition", k))?;
+
+            match column_type {
+                ColumnType::Integer => {
+                    assert_eq!(4, value.len());
+                    i32::from_be_bytes(value[0..4].try_into()?);
+                }
+                ColumnType::Text { size } => {
+                    dbg!(size);
+                    dbg!(value.len());
+                    assert!(*size as usize >= value.len());
+                    String::from_utf8(value.to_vec())?;
+                }
+                ColumnType::Bool => {
+                    assert_eq!(1, value.len());
+                    assert!(value[0] == 0 || value[1] == 1)
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 pub fn vector_to_array<T, const N: usize>(mut v: Vec<T>) -> anyhow::Result<[T; N]>
@@ -467,7 +546,7 @@ where
     let missing = N
         .checked_sub(v.len())
         .ok_or_else(|| anyhow!("invalid len of input"))?;
-
+    dbg!(missing);
     v.append(&mut (0..missing).map(|_| T::default()).collect());
 
     let t: Result<[T; N], _> = v.try_into();
@@ -484,7 +563,10 @@ mod tests {
     use tempdir::TempDir;
 
     use super::{vector_to_array, Row, Table};
-    use crate::table::{Deserialize, Serialize, ROWS_SIZE};
+    use crate::{
+        row::{Column, ColumnType, TableDefinition},
+        table::{Deserialize, Serialize},
+    };
     use std::{fs::File, io::Write};
 
     pub fn str_as_bytes(s: &str) -> Vec<u8> {
@@ -492,11 +574,6 @@ mod tests {
         buffer.write_all(s.as_bytes()).unwrap();
 
         buffer.to_vec()
-    }
-
-    #[test]
-    fn test_row_size() {
-        assert_eq!(291, ROWS_SIZE);
     }
 
     #[test]
@@ -536,7 +613,7 @@ mod tests {
         let r1 = Row {
             id: 1,
             username: vector_to_array(str_as_bytes("a".repeat(32).as_str())).unwrap(),
-            email: vector_to_array(str_as_bytes("a".repeat(255).as_str())).unwrap(),
+            email: vector_to_array(str_as_bytes("a".repeat(239).as_str())).unwrap(),
         };
         let r2 = Row {
             id: 2,
@@ -554,12 +631,20 @@ mod tests {
         File::create(&file_path)?;
 
         let mut db: Table<u32, Row> = Table::db_open(&file_path)?;
+        db.table_definition = Some(TableDefinition {
+            name: "test".to_string(),
+            columns: vec![
+                Column::new("id", ColumnType::Integer)?,
+                Column::new("username", ColumnType::Text { size: 32 })?,
+                Column::new("email", ColumnType::Text { size: 240 })?,
+            ],
+        });
 
         let wanted = vec![r1.clone(), r2.clone(), r3.clone()];
 
-        db.insert(1, r1).context("could not insert r1")?;
-        db.insert(3, r3)?;
-        db.insert(2, r2)?;
+        db.insert(r1.into()).context("could not insert r1")?;
+        db.insert(r3.into())?;
+        db.insert(r2.into())?;
 
         let got = db.collect()?;
         assert_eq!(wanted, got);
@@ -578,7 +663,7 @@ mod tests {
         let r1 = Row {
             id: 1,
             username: vector_to_array(str_as_bytes("a".repeat(32).as_str())).unwrap(),
-            email: vector_to_array(str_as_bytes("a".repeat(255).as_str())).unwrap(),
+            email: vector_to_array(str_as_bytes("a".repeat(240).as_str())).unwrap(),
         };
 
         let tmp_dir = TempDir::new("databurst")?;
@@ -586,11 +671,19 @@ mod tests {
         File::create(&file_path)?;
 
         let mut db: Table<u32, Row> = Table::db_open(&file_path)?;
+        db.table_definition = Some(TableDefinition {
+            name: "test".to_string(),
+            columns: vec![
+                Column::new("id", ColumnType::Integer)?,
+                Column::new("username", ColumnType::Text { size: 32 })?,
+                Column::new("email", ColumnType::Text { size: 240 })?,
+            ],
+        });
 
-        db.insert(1, r1.clone())?;
+        db.insert(r1.clone().into())?;
 
         assert!(db
-            .insert(1, r1)
+            .insert(r1.into())
             .unwrap_err()
             .to_string()
             .contains("duplicate key!"));
@@ -606,7 +699,7 @@ mod tests {
                 id: i,
                 username: vector_to_array(str_as_bytes("a".repeat(i as usize % 32).as_str()))
                     .unwrap(),
-                email: vector_to_array(str_as_bytes("b".repeat(i as usize % 255).as_str()))
+                email: vector_to_array(str_as_bytes("b".repeat(i as usize % 240).as_str()))
                     .unwrap(),
             })
         }
@@ -616,9 +709,17 @@ mod tests {
         File::create(&file_path)?;
 
         let mut db: Table<u32, Row> = Table::db_open(&file_path)?;
+        db.table_definition = Some(TableDefinition {
+            name: "test".to_string(),
+            columns: vec![
+                Column::new("id", ColumnType::Integer)?,
+                Column::new("username", ColumnType::Text { size: 32 })?,
+                Column::new("email", ColumnType::Text { size: 240 })?,
+            ],
+        });
 
         for row in rows {
-            db.insert(row.id, row)?;
+            db.insert(row.into())?;
         }
 
         db.print(db.root_page_num, "".to_string())?;
@@ -645,6 +746,34 @@ mod tests {
         assert!(row.is_some());
 
         db.close()?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_table_definition() -> anyhow::Result<()> {
+        let tmp_dir = TempDir::new("databurst")?;
+        let file_path = tmp_dir.path().join("my.db");
+        dbg!(&file_path);
+        File::create(&file_path)?;
+
+        let td = TableDefinition {
+            name: "test".to_string(),
+            columns: vec![
+                Column::new("column", ColumnType::Integer)?,
+                Column::new("column2", ColumnType::Bool)?,
+                Column::new("column3", ColumnType::Integer)?,
+                Column::new("column4", ColumnType::Text { size: 200 })?,
+                Column::new("column4", ColumnType::Text { size: 240 })?,
+            ],
+        };
+
+        let mut db: Table<u32, Row> = Table::db_open(&file_path)?;
+        db.table_definition = Some(td.clone());
+        db.close()?;
+
+        let db2: Table<u32, Row> = Table::db_open(&file_path)?;
+        assert_eq!(td, db2.table_definition.unwrap());
 
         Ok(())
     }

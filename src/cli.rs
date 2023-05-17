@@ -27,7 +27,7 @@ pub fn input_loop(mut table: Table<u32, Row>) -> anyhow::Result<()> {
                             table.select()?;
                         }
                         Query::Insert(id, username, email) => {
-                            table.insert(id, Row::try_from((id, username, email))?)?;
+                            table.insert(Row::try_from((id, username, email))?.into())?;
                         }
                         Query::Exit => break,
                     }

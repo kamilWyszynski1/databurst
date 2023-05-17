@@ -57,7 +57,6 @@ impl Cursor {
         if let NodeType::Leaf { kvs, next_leaf: _ } = &mut node.node_type {
             if let Some((Key(existing_key), existing_data)) = kvs.get_mut(self.cell_num as usize) {
                 if *existing_key == key {
-                    println!("replace");
                     // replace and return
                     *existing_data = data.to_vec();
                     // turn node back into bytes

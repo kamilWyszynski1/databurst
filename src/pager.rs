@@ -1,6 +1,7 @@
 use crate::{
     constants::{PAGE_SIZE, TABLE_MAX_PAGES},
     node::Node,
+    row::{TableDefinition, MAX_TABLE_DEFINITION_SIZE},
     table::vector_to_array,
 };
 use anyhow::bail;
@@ -60,7 +61,12 @@ impl Pager {
             .create(true)
             .open(p)?;
 
-        let file_len = f.metadata()?.len() as u32;
+        let mut f_len = f.metadata()?.len();
+        if f_len >= MAX_TABLE_DEFINITION_SIZE as u64 {
+            f_len -= MAX_TABLE_DEFINITION_SIZE as u64;
+        }
+
+        let file_len = f_len as u32;
         let num_pages = (file_len as usize / PAGE_SIZE) as u32;
 
         const INIT: Option<Rc<RefCell<Page>>> = None;
@@ -105,9 +111,10 @@ impl Pager {
             let mut buf = vec![];
 
             let mut reader = BufReader::new(&self.f);
-            // let reader = self.f.by_ref();
 
-            reader.seek(SeekFrom::Start((page_num as usize * PAGE_SIZE).try_into()?))?;
+            reader.seek(SeekFrom::Start(
+                (MAX_TABLE_DEFINITION_SIZE + page_num as usize * PAGE_SIZE).try_into()?,
+            ))?;
             reader.take(PAGE_SIZE as u64).read_to_end(&mut buf)?;
 
             // let's split page into chunks
@@ -130,7 +137,21 @@ impl Pager {
     }
 
     /// Gets pages content and write it to file filling missing bytes.
-    pub fn flush(mut self) -> anyhow::Result<()> {
+    /// Additionally we will write TableDefinition if this is first write to a file.
+    pub fn flush(mut self, table_def: Option<TableDefinition>) -> anyhow::Result<()> {
+        if self.file_len == 0 {
+            if let Some(table_def) = table_def {
+                self.f.rewind()?; // at the very end of a file
+
+                let mut table_def_bytes: Vec<u8> = table_def.into();
+                table_def_bytes.append(&mut vec![
+                    0u8;
+                    MAX_TABLE_DEFINITION_SIZE - table_def_bytes.len()
+                ]);
+                self.f.write_all(&table_def_bytes)?;
+            }
+        }
+
         for (i, page) in self
             .pages_rc
             .into_iter()
@@ -139,7 +160,9 @@ impl Pager {
             .map(|(i, p)| (i, p.unwrap()))
         {
             // go into proper place in file
-            self.f.seek(SeekFrom::Start((i * PAGE_SIZE).try_into()?))?;
+            let offset: u64 = (MAX_TABLE_DEFINITION_SIZE + (i * PAGE_SIZE)).try_into()?;
+            dbg!(offset);
+            self.f.seek(SeekFrom::Start(offset))?;
             // write content
             let mut content = page.borrow().content();
 
@@ -148,5 +171,15 @@ impl Pager {
             self.f.write_all(&content)?;
         }
         Ok(())
+    }
+
+    pub fn read_table_definition(&mut self) -> anyhow::Result<Option<TableDefinition>> {
+        if self.file_len == 0 {
+            return Ok(None);
+        }
+        let mut table_def_bytes = [0; MAX_TABLE_DEFINITION_SIZE];
+        self.f.read_exact(&mut table_def_bytes)?;
+
+        Ok(Some(TableDefinition::try_from(table_def_bytes.to_vec())?))
     }
 }
