@@ -370,6 +370,21 @@ impl Cursor {
         Ok(())
     }
 
+    pub fn select_by<F>(&mut self, mut cmp: F) -> anyhow::Result<Vec<Vec<u8>>>
+    where
+        F: FnMut(&Vec<u8>) -> bool,
+    {
+        let mut data = vec![];
+
+        select_all(self.pager.clone(), self.page_num, |_, _, _, bytes| {
+            if cmp(&bytes) {
+                data.push(bytes)
+            }
+        })?;
+
+        Ok(data)
+    }
+
     pub fn select(&mut self) -> anyhow::Result<Vec<Vec<u8>>> {
         let mut data = vec![];
 

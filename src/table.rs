@@ -10,6 +10,7 @@ use crate::{
     node::{Key, Node, NodeType},
     pager::Pager,
     row::{Column, ColumnType, TableDefinition},
+    statements::WhereStmt,
 };
 
 macro_rules! field_size {
@@ -216,6 +217,8 @@ impl Deserialize for RowID {
 #[derive(Debug)]
 pub struct Table<K, V> {
     pub root_page_num: u32,
+
+    //TODO: refactor indexing to take any arbitrary vector of bytes and key
     pub root_index_num: u32,
     pub pager: Rc<RefCell<Pager>>,
 
@@ -257,7 +260,7 @@ impl<K, V> Table<K, V> {
                     true,
                     true,
                     None,
-                    table_definition.size(),
+                    8,
                 );
                 index_root.borrow_mut().data = node.try_into()?;
             }
@@ -377,6 +380,21 @@ impl<K, V> Table<K, V>
 where
     V: Deserialize,
 {
+    pub fn search_with_where(&mut self, where_stmt: WhereStmt) -> anyhow::Result<Option<Vec<V>>> {
+        let mut cursor = self.cursor_start()?;
+
+        // perform sequential scan
+        let data = cursor.select_by(where_stmt.get_cmp(&self.table_definition)?)?;
+        if data.is_empty() {
+            return Ok(None);
+        }
+        let parsed: Vec<V> = data
+            .into_iter()
+            .map(|v| V::deserialize(&v).unwrap())
+            .collect();
+        Ok(Some(parsed))
+    }
+
     /// Searches for particular saved row.
     pub fn search(&mut self, id: u32) -> anyhow::Result<Option<V>> {
         let index_cursor = self.cursor_find(self.root_index_num, id)?;
@@ -557,8 +575,6 @@ where
                     i32::from_be_bytes(value[0..4].try_into()?);
                 }
                 ColumnType::Text { size } => {
-                    dbg!(size);
-                    dbg!(value.len());
                     assert!(*size as usize >= value.len());
                     String::from_utf8(value.to_vec())?;
                 }
@@ -580,7 +596,6 @@ where
     let missing = N
         .checked_sub(v.len())
         .ok_or_else(|| anyhow!("invalid len of input"))?;
-    dbg!(missing);
     v.append(&mut (0..missing).map(|_| T::default()).collect());
 
     let t: Result<[T; N], _> = v.try_into();
@@ -599,6 +614,7 @@ mod tests {
     use super::{vector_to_array, Row, Table};
     use crate::{
         row::{Column, ColumnType, TableDefinition},
+        statements::WhereStmt,
         table::{Deserialize, Serialize},
     };
     use std::{collections::HashMap, fs::File, io::Write};
@@ -895,15 +911,127 @@ mod tests {
             ("bool".to_string(), vec![1u8]),
         ]))?;
 
-        let data = db.search(1)?.context("inserted data not found")?;
+        {
+            let data = db.search(1)?.context("inserted data not found")?;
 
-        let read_id = i32::from_be_bytes(data[0..4].try_into()?);
-        let read_text = String::from_utf8(data[4..36].to_vec())?;
-        let read_bool = data[36] == 1;
+            let read_id = i32::from_be_bytes(data[0..4].try_into()?);
+            let read_text = String::from_utf8(data[4..36].to_vec())?;
+            let read_bool = data[36] == 1;
 
-        assert_eq!(read_id, 1);
-        assert_eq!(read_text.replace('\0', ""), text);
-        assert!(read_bool);
+            assert_eq!(read_id, 1);
+            assert_eq!(read_text.replace('\0', ""), text);
+            assert!(read_bool);
+        }
+        {
+            let data = db
+                .search_with_where(WhereStmt {
+                    column: "id".to_string(),
+                    value: vec![0u8, 0u8, 0u8, 1u8],
+                })?
+                .context("inserted data not found")?;
+            assert_eq!(1, data.len());
+
+            let row = data[0].clone();
+            let read_id = i32::from_be_bytes(row[0..4].try_into()?);
+            let read_text = String::from_utf8(row[4..36].to_vec())?;
+            let read_bool = row[36] == 1;
+
+            assert_eq!(read_id, 1);
+            assert_eq!(read_text.replace('\0', ""), text);
+            assert!(read_bool);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_search_with_where() -> anyhow::Result<()> {
+        let mut rows = vec![];
+        for i in 1..=128 {
+            rows.push(Row {
+                id: i,
+                username: vector_to_array(str_as_bytes("a".repeat(i as usize % 32).as_str()))
+                    .unwrap(),
+                email: vector_to_array(str_as_bytes("b".repeat(i as usize % 240).as_str()))
+                    .unwrap(),
+            })
+        }
+
+        let tmp_dir = TempDir::new("databurst")?;
+        let file_path = tmp_dir.path().join("my.db");
+        File::create(&file_path)?;
+
+        let mut db: Table<u32, Row> = Table::new(
+            &file_path,
+            TableDefinition {
+                name: "test".to_string(),
+                columns: vec![
+                    Column::new("id", ColumnType::Integer)?,
+                    Column::new("username", ColumnType::Text { size: 32 })?,
+                    Column::new("email", ColumnType::Text { size: 240 })?,
+                ],
+            },
+        )?;
+
+        for row in rows {
+            db.insert(row.into())?;
+        }
+
+        let rows = db
+            .search_with_where(WhereStmt {
+                column: "username".to_string(),
+                value: str_as_bytes("a".repeat(4).as_str()),
+            })?
+            .context("rows should be found")?;
+        assert_eq!(4, rows.len());
+
+        db.close()?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_search_with_where_many() -> anyhow::Result<()> {
+        let mut rows = vec![];
+        for i in 1..=2000 {
+            rows.push(Row {
+                id: i,
+                username: vector_to_array(str_as_bytes("a".repeat(i as usize % 20).as_str()))
+                    .unwrap(),
+                email: vector_to_array(str_as_bytes("b".repeat(i as usize % 240).as_str()))
+                    .unwrap(),
+            })
+        }
+
+        let tmp_dir = TempDir::new("databurst")?;
+        let file_path = tmp_dir.path().join("my.db");
+        File::create(&file_path)?;
+
+        let mut db: Table<u32, Row> = Table::new(
+            &file_path,
+            TableDefinition {
+                name: "test".to_string(),
+                columns: vec![
+                    Column::new("id", ColumnType::Integer)?,
+                    Column::new("username", ColumnType::Text { size: 32 })?,
+                    Column::new("email", ColumnType::Text { size: 240 })?,
+                ],
+            },
+        )?;
+
+        for row in rows {
+            db.insert(row.into())?;
+        }
+
+        let rows = db
+            .search_with_where(WhereStmt {
+                column: "username".to_string(),
+                value: str_as_bytes("a".repeat(4).as_str()),
+            })?
+            .context("rows should be found")?;
+        assert_eq!(100, rows.len());
+
+        db.close()?;
 
         Ok(())
     }

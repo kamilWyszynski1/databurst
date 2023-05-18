@@ -165,7 +165,6 @@ impl Pager {
         {
             // go into proper place in file
             let offset: u64 = (MAX_TABLE_DEFINITION_SIZE + (i * PAGE_SIZE)).try_into()?;
-            dbg!(offset);
             self.f.seek(SeekFrom::Start(offset))?;
             // write content
             let mut content = page.borrow().content();

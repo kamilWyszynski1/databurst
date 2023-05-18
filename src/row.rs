@@ -27,7 +27,7 @@ impl ColumnType {
         }
     }
 
-    fn byte_size(&self) -> usize {
+    pub fn byte_size(&self) -> usize {
         match self {
             ColumnType::Integer => 4,
             ColumnType::Bool => 1,
