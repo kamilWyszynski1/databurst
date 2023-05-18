@@ -1,6 +1,11 @@
 use anyhow::{anyhow, bail, Context};
 use std::{
-    cell::RefCell, collections::HashMap, fmt::Debug, marker::PhantomData, path::Path, rc::Rc,
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    fmt::Debug,
+    marker::PhantomData,
+    path::Path,
+    rc::Rc,
     str::from_utf8,
 };
 
@@ -215,16 +220,29 @@ impl Deserialize for RowID {
 }
 
 #[derive(Debug)]
+struct Indexes {
+    /// Set of columns names to be indexed and their page numbers.
+    columns: HashMap<String, u32>,
+}
+
+impl Default for Indexes {
+    fn default() -> Self {
+        Self {
+            columns: HashMap::from([("id".to_string(), 1)]),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct Table<K, V> {
     pub root_page_num: u32,
-
-    //TODO: refactor indexing to take any arbitrary vector of bytes and key
-    pub root_index_num: u32,
     pub pager: Rc<RefCell<Pager>>,
 
     /// Describes table's schema.
     //TODO: add in constructor and validate if definition has 'id' column.
     pub table_definition: TableDefinition,
+
+    indexes: Indexes,
 
     marker: PhantomData<(K, V)>,
 }
@@ -251,6 +269,7 @@ impl<K, V> Table<K, V> {
             }
 
             {
+                // index root page num is saved in Indexes as default for 'id' column
                 let index_root = pager.get_page(1)?;
                 let node = Node::new(
                     NodeType::Leaf {
@@ -268,10 +287,10 @@ impl<K, V> Table<K, V> {
 
         Ok(Self {
             root_page_num: 0,
-            root_index_num: 1,
             pager: Rc::new(RefCell::new(pager)),
             marker: PhantomData,
             table_definition,
+            indexes: Indexes::default(),
         })
     }
 
@@ -286,6 +305,31 @@ impl<K, V> Table<K, V> {
         Self::new(p, table_definition)
     }
 
+    // TODO: implement updating index when data already exist.
+    fn add_indexed_column(&mut self, column: String) -> anyhow::Result<()> {
+        if self.indexes.columns.contains_key(&column) {
+            return Ok(());
+        }
+
+        let index_page_num = self.pager.borrow_mut().get_unused_page_num();
+        let index_page = self.pager.borrow_mut().get_page(index_page_num)?;
+        let node = Node::new(
+            NodeType::Leaf {
+                kvs: vec![],
+                next_leaf: None,
+            },
+            true,
+            true,
+            None,
+            8,
+        );
+        index_page.borrow_mut().data = node.try_into()?;
+
+        self.indexes.columns.insert(column, index_page_num);
+
+        Ok(())
+    }
+
     fn update_index_for_node(&mut self, page_num: u32, node: Node) -> anyhow::Result<()> {
         match node.node_type {
             NodeType::Internal {
@@ -295,6 +339,8 @@ impl<K, V> Table<K, V> {
                 bail!("could not update index for Interal node");
             }
             NodeType::Leaf { kvs, next_leaf: _ } => {
+                // TODO: if there are indexes on different columns that 'id' we need to divide
+                // data bytes into proper 'keys' to use them in indexing
                 for (cell_num, (key, _)) in kvs.into_iter().enumerate() {
                     let row_id = RowID {
                         page_num,
@@ -397,7 +443,7 @@ where
 
     /// Searches for particular saved row.
     pub fn search(&mut self, key: Key) -> anyhow::Result<Option<V>> {
-        let index_cursor = self.cursor_find(self.root_index_num, &key)?;
+        let index_cursor = self.cursor_find(1, &key)?;
         let row_cursor = match index_cursor.data()? {
             Some(data) => {
                 let index = RowID::deserialize(&data)?;
@@ -542,8 +588,17 @@ where
                         page_num: cursor.page_num,
                         cell_num: cursor.cell_num,
                     };
-                    self.cursor_find(self.root_index_num, &key)?
-                        .insert(key, &row_id.serialize())?;
+
+                    for (index_column, index_page_num) in self.indexes.columns {
+                        let indexed_key: Key = values
+                            .get(&index_column)
+                            .context("there's no indexed column in values")?
+                            .clone()
+                            .into();
+
+                        self.cursor_find(index_page_num, &indexed_key)?
+                            .insert(indexed_key, &row_id.serialize())?;
+                    }
                 }
             }
             OperationInfo::Replace => {}
@@ -778,7 +833,7 @@ mod tests {
 
         db.print(db.root_page_num, "".to_string())?;
         println!();
-        db.print(db.root_index_num, "".to_string())?;
+        db.print(1, "".to_string())?;
 
         let rows = db.collect()?;
         assert_eq!(rows.len(), 50);
