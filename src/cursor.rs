@@ -47,7 +47,7 @@ impl Cursor {
         }
     }
 
-    pub fn insert(&self, key: u32, data: &[u8]) -> anyhow::Result<OperationInfo> {
+    pub fn insert(&self, key: Key, data: &[u8]) -> anyhow::Result<OperationInfo> {
         let page = self.pager.try_borrow_mut()?.get_page(self.page_num)?;
 
         // turn page's bytes into readable node
@@ -61,7 +61,7 @@ impl Cursor {
 
         // check if cell_num is already occupied, if key matches, replace value
         if let NodeType::Leaf { kvs, next_leaf: _ } = &mut node.node_type {
-            if let Some((Key(existing_key), existing_data)) = kvs.get_mut(self.cell_num as usize) {
+            if let Some((existing_key, existing_data)) = kvs.get_mut(self.cell_num as usize) {
                 if *existing_key == key {
                     // replace and return
                     *existing_data = data.to_vec();
@@ -111,7 +111,7 @@ impl Cursor {
     /// Update parent or create a new parent.
     pub fn leaf_node_split_and_insert(
         &self,
-        key: u32,
+        key: Key,
         data: &[u8],
     ) -> anyhow::Result<SplitMetadata> {
         let mut left_page_num = self.page_num;
@@ -214,7 +214,7 @@ impl Cursor {
         &self,
         page_num: u32,
         right_child_num: u32,
-        key: u32,
+        key: Key,
     ) -> anyhow::Result<()> {
         let page = self.pager.borrow_mut().get_page(page_num)?;
         let node = Node::try_from(page.clone())?;
@@ -238,9 +238,9 @@ impl Cursor {
                 {
                     // find place to insert key
                     let inx = child_pointer_pairs
-                        .binary_search_by_key(&key, |(_, Key(key))| *key)
+                        .binary_search_by_key(&&key, |(_, key)| key)
                         .unwrap_or_else(|x| x);
-                    child_pointer_pairs.insert(inx, (Pointer(self.page_num), Key(key)));
+                    child_pointer_pairs.insert(inx, (Pointer(self.page_num), key));
 
                     // split
                     let siblings = child_pointer_pairs.split_off((pointers_len + 1) / 2);
@@ -248,7 +248,7 @@ impl Cursor {
                     let (max_pointer, max_left) = child_pointer_pairs
                         .clone()
                         .into_iter()
-                        .max_by_key(|(_, Key(key))| *key)
+                        .max_by_key(|(_, key)| key.clone())
                         .context("cannot find max")?;
 
                     let new_page_num = self.pager.borrow().get_unused_page_num();
@@ -325,7 +325,7 @@ impl Cursor {
                         let parent = node
                             .parent
                             .context("internal node which is not root without parent")?;
-                        self.insert_into_internal(parent, new_page_num, max_left.0)?;
+                        self.insert_into_internal(parent, new_page_num, max_left)?;
                     }
                 } else {
                     if key
@@ -333,18 +333,17 @@ impl Cursor {
                             .last()
                             .context("there's no last item")?
                             .1
-                             .0
                     {
                         let right_child_key =
                             Node::try_from(self.pager.borrow_mut().get_page(right_child.0)?)?
                                 .max_key();
-                        child_pointer_pairs.push((right_child, Key(right_child_key)));
+                        child_pointer_pairs.push((right_child, right_child_key));
                         right_child = Pointer(right_child_num);
                     } else {
                         let inx = child_pointer_pairs
-                            .binary_search_by_key(&key, |(_, Key(key))| *key)
+                            .binary_search_by_key(&&key, |(_, key)| key)
                             .unwrap_or_else(|x| x);
-                        child_pointer_pairs.insert(inx, (Pointer(self.page_num), Key(key)));
+                        child_pointer_pairs.insert(inx, (Pointer(self.page_num), key));
                     }
 
                     // update node
@@ -418,21 +417,21 @@ impl Cursor {
     }
 }
 
-impl TryInto<BTreeMap<u32, RowID>> for Cursor {
-    type Error = anyhow::Error;
+// impl TryInto<BTreeMap<u32, RowID>> for Cursor {
+//     type Error = anyhow::Error;
 
-    fn try_into(self) -> anyhow::Result<BTreeMap<u32, RowID>, Self::Error> {
-        let mut map = BTreeMap::default();
-        select_all(
-            self.pager.clone(),
-            self.page_num,
-            |page_num, cell_num, Key(key), _| {
-                map.insert(key, RowID { page_num, cell_num });
-            },
-        )?;
-        Ok(map)
-    }
-}
+//     fn try_into(self) -> anyhow::Result<BTreeMap<u32, RowID>, Self::Error> {
+//         let mut map = BTreeMap::default();
+//         select_all(
+//             self.pager.clone(),
+//             self.page_num,
+//             |page_num, cell_num, key, _| {
+//                 map.insert(key, RowID { page_num, cell_num });
+//             },
+//         )?;
+//         Ok(map)
+//     }
+// }
 
 fn select_all<F: FnMut(u32, u32, Key, Vec<u8>)>(
     pager: Rc<RefCell<Pager>>,
@@ -503,7 +502,7 @@ mod test {
         let root = Node::new(
             NodeType::Internal {
                 right_child: Pointer(1),
-                child_pointer_pairs: vec![(Pointer(0), Key(1))],
+                child_pointer_pairs: vec![(Pointer(0), 1.into())],
             },
             true,
             false,
@@ -514,19 +513,19 @@ mod test {
         let node_1 = Node::new(
             NodeType::Leaf {
                 kvs: vec![
-                    (Key(1), row_bytes.clone()),
-                    (Key(2), row_bytes.clone()),
-                    (Key(3), row_bytes.clone()),
-                    (Key(4), row_bytes.clone()),
-                    (Key(5), row_bytes.clone()),
-                    (Key(6), row_bytes.clone()),
-                    (Key(7), row_bytes.clone()),
-                    (Key(8), row_bytes.clone()),
-                    (Key(9), row_bytes.clone()),
-                    (Key(10), row_bytes.clone()),
-                    (Key(11), row_bytes.clone()),
-                    (Key(12), row_bytes.clone()),
-                    (Key(13), row_bytes.clone()),
+                    (1.into(), row_bytes.clone()),
+                    (2.into(), row_bytes.clone()),
+                    (3.into(), row_bytes.clone()),
+                    (4.into(), row_bytes.clone()),
+                    (5.into(), row_bytes.clone()),
+                    (6.into(), row_bytes.clone()),
+                    (7.into(), row_bytes.clone()),
+                    (8.into(), row_bytes.clone()),
+                    (9.into(), row_bytes.clone()),
+                    (10.into(), row_bytes.clone()),
+                    (11.into(), row_bytes.clone()),
+                    (12.into(), row_bytes.clone()),
+                    (13.into(), row_bytes.clone()),
                 ],
                 next_leaf: Some(Pointer(2)),
             },
@@ -555,7 +554,7 @@ mod test {
 
         let pager = Rc::new(RefCell::new(pager));
         let cursor = Cursor::new(pager.clone(), 1, 0);
-        cursor.leaf_node_split_and_insert(15, &row_bytes)?;
+        cursor.leaf_node_split_and_insert(15.into(), &row_bytes)?;
 
         let node_1 = Node::try_from(page_1)?;
 

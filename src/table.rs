@@ -295,12 +295,12 @@ impl<K, V> Table<K, V> {
                 bail!("could not update index for Interal node");
             }
             NodeType::Leaf { kvs, next_leaf: _ } => {
-                for (cell_num, (Key(key), _)) in kvs.into_iter().enumerate() {
+                for (cell_num, (key, _)) in kvs.into_iter().enumerate() {
                     let row_id = RowID {
                         page_num,
                         cell_num: cell_num as u32,
                     };
-                    let cursor = self.cursor_find(self.root_index_num, key)?;
+                    let cursor = self.cursor_find(self.root_index_num, &key)?;
                     cursor.insert(key, &row_id.serialize())?;
                 }
             }
@@ -325,7 +325,7 @@ impl<K, V> Table<K, V> {
 
     /// Return the position of the given key.
     /// If the key is not present, return the position where it should be inserted.
-    fn cursor_find(&mut self, page_num: u32, key: u32) -> anyhow::Result<Cursor> {
+    fn cursor_find(&mut self, page_num: u32, key: &Key) -> anyhow::Result<Cursor> {
         let root_page = self.pager.borrow_mut().get_page(page_num)?;
         let root_node = Node::try_from(root_page.borrow().clone())?;
         let mut cursor = Cursor::new(self.pager.clone(), page_num, 0);
@@ -336,7 +336,7 @@ impl<K, V> Table<K, V> {
                 child_pointer_pairs,
             } => {
                 let inx = child_pointer_pairs
-                    .binary_search_by_key(&key, |(_, k)| k.0)
+                    .binary_search_by_key(&key, |(_, k)| k)
                     .unwrap_or_else(|x| x);
 
                 if inx == child_pointer_pairs.len() {
@@ -354,7 +354,7 @@ impl<K, V> Table<K, V> {
             }
             NodeType::Leaf { kvs, next_leaf: _ } => {
                 let inx = kvs
-                    .binary_search_by_key(&key, |(k, _)| k.0)
+                    .binary_search_by_key(&key, |(k, _)| k)
                     .unwrap_or_else(|x| x);
                 cursor.cell_num = inx as u32;
                 Ok(cursor)
@@ -396,14 +396,14 @@ where
     }
 
     /// Searches for particular saved row.
-    pub fn search(&mut self, id: u32) -> anyhow::Result<Option<V>> {
-        let index_cursor = self.cursor_find(self.root_index_num, id)?;
+    pub fn search(&mut self, key: Key) -> anyhow::Result<Option<V>> {
+        let index_cursor = self.cursor_find(self.root_index_num, &key)?;
         let row_cursor = match index_cursor.data()? {
             Some(data) => {
                 let index = RowID::deserialize(&data)?;
                 Cursor::new(self.pager.clone(), index.page_num, index.cell_num)
             }
-            None => self.cursor_find(self.root_page_num, id)?,
+            None => self.cursor_find(self.root_page_num, &key)?,
         };
 
         Ok(match row_cursor.data()? {
@@ -441,8 +441,8 @@ where
                     node.parent.map(|x| x.to_string()).unwrap_or_default(),
                     child_pointer_pairs
                         .iter()
-                        .map(|(Pointer(pointer), Key(key))| (*pointer, *key))
-                        .collect::<Vec<(u32, u32)>>(),
+                        .map(|(Pointer(pointer), key)| (*pointer, key.clone()))
+                        .collect::<Vec<(u32, Key)>>(),
                     right_child
                 );
                 for (pointer, _) in child_pointer_pairs {
@@ -456,7 +456,7 @@ where
                         "{ident}({page_num}) leaf: [parent: {}, inx: {}](kvs: {:?}, next_leaf: {:?})",
                         node.parent.map(|x| x.to_string()).unwrap_or_default(),
                         node.is_index,
-                        kvs.iter().map(|(Key(key), data)| (key, RowID::deserialize(data).unwrap())).map(|(key, row_id)| format!("{} -> ({}, {})", key, row_id.page_num, row_id.cell_num)).collect::<Vec<String>>(),
+                        kvs.iter().map(|(Key(key), data)| (key, RowID::deserialize(data).unwrap())).map(|(key, row_id)| format!("{:?} -> ({}, {})", key, row_id.page_num, row_id.cell_num)).collect::<Vec<String>>(),
                         next_leaf,
                     )
                 } else {
@@ -464,7 +464,7 @@ where
                         "{ident}({page_num}) leaf: [parent: {}, inx: {}](kvs: {:?}, next_leaf: {:?})",
                         node.parent.map(|x| x.to_string()).unwrap_or_default(),
                         node.is_index,
-                        kvs.iter().map(|(key, _)| key.0).collect::<Vec<u32>>(),
+                        kvs.iter().map(|(key, _)| key.clone()).collect::<Vec<Key>>(),
                         next_leaf,
                     )
                 }
@@ -483,13 +483,11 @@ where
         // ===== CHECK DATA ===== //
         self.check_data_type_coercion(&values)?;
 
-        let key = {
-            let id_value: Vec<u8> = values
-                .get("id")
-                .context("every table has to have 'id' column")?
-                .clone();
-            u32::from_be_bytes(id_value[0..4].try_into()?)
-        };
+        let key: Key = values
+            .get("id")
+            .context("every table has to have 'id' column")?
+            .clone()
+            .into();
 
         // ===== PREPARE DATA ===== //
         let mut data = vec![];
@@ -515,7 +513,7 @@ where
             Node::try_from(page.borrow().clone()).context("could not create Node from Page")?;
 
         let num_cells = node.num_cells();
-        let cursor = self.cursor_find(self.root_page_num, key)?;
+        let cursor = self.cursor_find(self.root_page_num, &key)?;
 
         if cursor.cell_num < num_cells {
             if let Some(key_at_index) = node.leaf_node_key(cursor.cell_num)? {
@@ -525,7 +523,7 @@ where
             }
         }
         // cursor.insert(key, &data)?;
-        match cursor.insert(key, &data)? {
+        match cursor.insert(key.clone(), &data)? {
             OperationInfo::Insert {
                 split_occurred,
                 metadata,
@@ -544,7 +542,7 @@ where
                         page_num: cursor.page_num,
                         cell_num: cursor.cell_num,
                     };
-                    self.cursor_find(self.root_index_num, key)?
+                    self.cursor_find(self.root_index_num, &key)?
                         .insert(key, &row_id.serialize())?;
                 }
             }
@@ -785,7 +783,7 @@ mod tests {
         let rows = db.collect()?;
         assert_eq!(rows.len(), 50);
 
-        let row = db.search(10)?.unwrap();
+        let row = db.search(10.into())?.unwrap();
         assert_eq!(
             row.email,
             vector_to_array(str_as_bytes("b".repeat(10).as_str()))?
@@ -795,10 +793,10 @@ mod tests {
             vector_to_array(str_as_bytes("a".repeat(10).as_str()))?
         );
 
-        let row = db.search(100)?;
+        let row = db.search(100.into())?;
         assert!(row.is_none());
 
-        let row = db.search(50)?;
+        let row = db.search(50.into())?;
         assert!(row.is_some());
 
         db.close()?;
@@ -912,7 +910,7 @@ mod tests {
         ]))?;
 
         {
-            let data = db.search(1)?.context("inserted data not found")?;
+            let data = db.search(1.into())?.context("inserted data not found")?;
 
             let read_id = i32::from_be_bytes(data[0..4].try_into()?);
             let read_text = String::from_utf8(data[4..36].to_vec())?;

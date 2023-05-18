@@ -19,11 +19,17 @@ impl From<u32> for Pointer {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Key(pub u32);
+#[derive(Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Key(pub Vec<u8>);
 
 impl From<u32> for Key {
     fn from(value: u32) -> Self {
+        Self(value.to_be_bytes().to_vec())
+    }
+}
+
+impl From<Vec<u8>> for Key {
+    fn from(value: Vec<u8>) -> Self {
         Self(value)
     }
 }
@@ -219,7 +225,7 @@ impl Node {
         }
     }
 
-    pub fn leaf_node_key(&self, cell_num: u32) -> anyhow::Result<Option<u32>> {
+    pub fn leaf_node_key(&self, cell_num: u32) -> anyhow::Result<Option<Key>> {
         match self.node_type {
             NodeType::Internal {
                 right_child: _,
@@ -232,8 +238,7 @@ impl Node {
                 kvs.get(cell_num as usize)
                     .context("could not get value by cell_num")?
                     .clone()
-                    .0
-                     .0,
+                    .0,
             )),
         }
     }
@@ -248,22 +253,21 @@ impl Node {
         }
     }
 
-    pub fn max_key(&self) -> u32 {
+    pub fn max_key(&self) -> Key {
         match &self.node_type {
             NodeType::Internal {
                 right_child: _,
                 child_pointer_pairs,
-            } => {
-                child_pointer_pairs
-                    .iter()
-                    .map(|(_, key)| *key)
-                    .last()
-                    .unwrap_or_default()
-                    .0
-            }
-            NodeType::Leaf { kvs, next_leaf: _ } => {
-                kvs.iter().map(|(key, _)| *key).last().unwrap_or_default().0
-            }
+            } => child_pointer_pairs
+                .iter()
+                .map(|(_, key)| key.clone())
+                .last()
+                .unwrap_or_default(),
+            NodeType::Leaf { kvs, next_leaf: _ } => kvs
+                .iter()
+                .map(|(key, _)| key.clone())
+                .last()
+                .unwrap_or_default(),
         }
     }
 
@@ -406,7 +410,7 @@ impl TryFrom<Page> for Node {
                             .context("could not parse child pointer")?,
                     );
                     offset += LEAF_NODE_KEY_SIZE;
-                    let key = pointer_from_bytes(&data, offset).context("could not parse key")?;
+                    let key = data[offset..offset + LEAF_NODE_KEY_SIZE].to_vec();
                     offset += LEAF_NODE_KEY_SIZE;
 
                     child_pointer_pairs.push((pointer, Key(key)));
@@ -442,7 +446,7 @@ impl TryFrom<Page> for Node {
                     value.row_size
                 };
                 for _ in 0..num_cells {
-                    let key = pointer_from_bytes(&data, offset).context("could not parse key")?;
+                    let key = data[offset..offset + LEAF_NODE_KEY_SIZE].to_vec();
                     offset += LEAF_NODE_KEY_SIZE;
                     let data = value.get_ptr_from_offset(offset, row_size);
                     offset += row_size;
@@ -494,11 +498,11 @@ impl TryFrom<Node> for [u8; PAGE_SIZE] {
                     .copy_from_slice(&right_child.0.to_be_bytes());
                 offset += LEAF_NODE_KEY_SIZE;
 
-                for (pointer, key) in child_pointer_pairs {
+                for (pointer, Key(key)) in child_pointer_pairs {
                     buf[offset..offset + LEAF_NODE_KEY_SIZE]
                         .copy_from_slice(&pointer.0.to_be_bytes());
                     offset += LEAF_NODE_KEY_SIZE;
-                    buf[offset..offset + LEAF_NODE_KEY_SIZE].copy_from_slice(&key.0.to_be_bytes());
+                    buf[offset..offset + LEAF_NODE_KEY_SIZE].copy_from_slice(&key);
                     offset += LEAF_NODE_KEY_SIZE;
                 }
             }
@@ -515,9 +519,9 @@ impl TryFrom<Node> for [u8; PAGE_SIZE] {
 
                 for (Key(key), v) in kvs {
                     if offset + LEAF_NODE_KEY_SIZE == 4098 {
-                        println!("here");
+                        println!("here")
                     }
-                    buf[offset..offset + LEAF_NODE_KEY_SIZE].copy_from_slice(&key.to_be_bytes());
+                    buf[offset..offset + LEAF_NODE_KEY_SIZE].copy_from_slice(&key);
                     offset += LEAF_NODE_KEY_SIZE;
                     buf[offset..offset + row_size].copy_from_slice(&v);
                     offset += row_size;
