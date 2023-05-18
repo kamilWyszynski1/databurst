@@ -3,7 +3,7 @@ use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 use anyhow::{bail, Context, Ok};
 
 use crate::{
-    constants::{LEAF_INDEX_NODE_MAX_CELLS, LEAF_NODE_MAX_CELLS},
+    constants::{LEAF_INDEX_NODE_MAX_CELLS, LEAF_NODE_KEY_SIZE, LEAF_NODE_SPACE_FOR_CELLS},
     node::{Key, Node, NodeType, Pointer},
     pager::Pager,
     table::RowID,
@@ -53,6 +53,12 @@ impl Cursor {
         // turn page's bytes into readable node
         let mut node = Node::try_from(page.borrow().clone())?;
 
+        let leaf_node_max_cells = {
+            let leaf_node_value_size = node.row_size;
+            let leaf_node_cells_size = LEAF_NODE_KEY_SIZE + leaf_node_value_size;
+            LEAF_NODE_SPACE_FOR_CELLS / leaf_node_cells_size
+        };
+
         // check if cell_num is already occupied, if key matches, replace value
         if let NodeType::Leaf { kvs, next_leaf: _ } = &mut node.node_type {
             if let Some((Key(existing_key), existing_data)) = kvs.get_mut(self.cell_num as usize) {
@@ -70,7 +76,7 @@ impl Cursor {
 
         // check if split is needed
         if (node.is_index && num_cells >= LEAF_INDEX_NODE_MAX_CELLS)
-            || (!node.is_index && num_cells >= LEAF_NODE_MAX_CELLS)
+            || (!node.is_index && num_cells >= leaf_node_max_cells)
         {
             let metadata = self.leaf_node_split_and_insert(key, data)?;
             return Ok(OperationInfo::Insert {
@@ -215,6 +221,11 @@ impl Cursor {
         let is_index = node.is_index;
 
         let row_size = node.row_size;
+        let leaf_node_max_cells = {
+            let leaf_node_value_size = node.row_size;
+            let leaf_node_cells_size = LEAF_NODE_KEY_SIZE + leaf_node_value_size;
+            LEAF_NODE_SPACE_FOR_CELLS / leaf_node_cells_size
+        };
 
         match node.node_type {
             NodeType::Internal {
@@ -223,7 +234,7 @@ impl Cursor {
             } => {
                 let pointers_len = child_pointer_pairs.len();
                 if (is_index && pointers_len == LEAF_INDEX_NODE_MAX_CELLS)
-                    || (!is_index && pointers_len == LEAF_NODE_MAX_CELLS)
+                    || (!is_index && pointers_len == leaf_node_max_cells)
                 {
                     // find place to insert key
                     let inx = child_pointer_pairs

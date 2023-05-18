@@ -26,6 +26,14 @@ impl ColumnType {
             ColumnType::Text { size } => TEXT_INDICATOR + *size,
         }
     }
+
+    fn byte_size(&self) -> usize {
+        match self {
+            ColumnType::Integer => 4,
+            ColumnType::Bool => 1,
+            ColumnType::Text { size } => *size as usize,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -58,6 +66,12 @@ pub struct TableDefinition {
 
     // column's name to its type mapping
     pub columns: Vec<Column>,
+}
+
+impl TableDefinition {
+    pub fn size(&self) -> usize {
+        self.columns.iter().map(|c| c.column_type.byte_size()).sum()
+    }
 }
 
 impl TryFrom<Vec<u8>> for TableDefinition {

@@ -3,7 +3,7 @@ use crate::table::{EMAIL_SIZE, ID_SIZE, USERNAME_SIZE};
 pub const ID_OFFSET: usize = 0;
 pub const USERNAME_OFFSET: usize = ID_OFFSET + ID_SIZE;
 pub const EMAIL_OFFSET: usize = USERNAME_OFFSET + USERNAME_SIZE;
-pub const ROWS_SIZE: usize = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE;
+// pub const ROWS_SIZE: usize = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE;
 
 pub const TABLE_MAX_PAGES: usize = 100;
 pub const PAGE_SIZE: usize = 4096; // 4KB
@@ -24,10 +24,10 @@ pub const LEAF_NODE_HEADER_SIZE: usize = COMMON_NODE_HEADER_SIZE + LEAF_NODE_NUM
 
 // Leaf node body layout
 pub const LEAF_NODE_KEY_SIZE: usize = 4;
-pub const LEAF_NODE_VALUE_SIZE: usize = ROWS_SIZE;
-pub const LEAF_NODE_CELL_SIZE: usize = LEAF_NODE_KEY_SIZE + LEAF_NODE_VALUE_SIZE;
+// pub const LEAF_NODE_VALUE_SIZE: usize = ROWS_SIZE;
+// pub const LEAF_NODE_CELL_SIZE: usize = LEAF_NODE_KEY_SIZE + LEAF_NODE_VALUE_SIZE;
 pub const LEAF_NODE_SPACE_FOR_CELLS: usize = PAGE_SIZE - LEAF_NODE_HEADER_SIZE;
-pub const LEAF_NODE_MAX_CELLS: usize = LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE;
+// pub const LEAF_NODE_MAX_CELLS: usize = LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE;
 
 // Leaf node body layout
 pub const LEAF_INDEX_NODE_KEY_SIZE: usize = 4;

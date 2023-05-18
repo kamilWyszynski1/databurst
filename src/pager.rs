@@ -144,18 +144,16 @@ impl Pager {
 
     /// Gets pages content and write it to file filling missing bytes.
     /// Additionally we will write TableDefinition if this is first write to a file.
-    pub fn flush(mut self, table_def: Option<TableDefinition>) -> anyhow::Result<()> {
+    pub fn flush(mut self, table_def: TableDefinition) -> anyhow::Result<()> {
         if self.file_len == 0 {
-            if let Some(table_def) = table_def {
-                self.f.rewind()?; // at the very end of a file
+            self.f.rewind()?; // at the very end of a file
 
-                let mut table_def_bytes: Vec<u8> = table_def.into();
-                table_def_bytes.append(&mut vec![
-                    0u8;
-                    MAX_TABLE_DEFINITION_SIZE - table_def_bytes.len()
-                ]);
-                self.f.write_all(&table_def_bytes)?;
-            }
+            let mut table_def_bytes: Vec<u8> = table_def.into();
+            table_def_bytes.append(&mut vec![
+                0u8;
+                MAX_TABLE_DEFINITION_SIZE - table_def_bytes.len()
+            ]);
+            self.f.write_all(&table_def_bytes)?;
         }
 
         for (i, page) in self
