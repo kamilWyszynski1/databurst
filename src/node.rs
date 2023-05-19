@@ -2,7 +2,7 @@ use std::{cell::RefCell, rc::Rc};
 
 use crate::{
     constants::{
-        IS_ROOT_OFFSET, LEAF_INDEX_NODE_CELL_SIZE, LEAF_NODE_HEADER_SIZE, LEAF_NODE_KEY_SIZE,
+        IS_ROOT_OFFSET, LEAF_INDEX_NODE_CELL_SIZE, LEAF_NODE_HEADER_SIZE,
         LEAF_NODE_NUM_CELLS_OFFSET, LEAF_NODE_NUM_CELLS_SIZE, NODE_TYPE_OFFSET, PAGE_SIZE,
         PARENT_POINTER_OFFSET, PARENT_POINTER_SIZE,
     },
@@ -142,6 +142,9 @@ pub struct Node {
     pub is_index: bool,
     pub parent: Option<u32>, // parent offset
 
+    /// Amount of bytes that row's key takes. It is dynamical because indexes' keys can be arbitrary values like strings.
+    pub key_size: usize,
+    /// Amount of bytes that row "body" takes.
     pub row_size: usize,
 }
 
@@ -178,6 +181,7 @@ impl Node {
         is_root: bool,
         is_index: bool,
         parent: Option<u32>,
+        key_size: usize,
         row_size: usize,
     ) -> Self {
         Self {
@@ -185,12 +189,23 @@ impl Node {
             is_root,
             is_index,
             parent,
+            key_size,
             row_size,
         }
     }
 
-    pub fn save(self, page_num: u32, pager: Rc<RefCell<Pager>>) -> anyhow::Result<()> {
-        pager.borrow_mut().get_page(page_num)?.borrow_mut().data = self.try_into()?;
+    pub fn save(
+        self,
+        page_num: u32,
+        pager: Rc<RefCell<Pager>>,
+        key_size: usize,
+        row_size: usize,
+    ) -> anyhow::Result<()> {
+        pager
+            .borrow_mut()
+            .get_page(page_num, key_size, row_size)?
+            .borrow_mut()
+            .data = self.try_into()?;
         Ok(())
     }
 
@@ -319,15 +334,17 @@ impl Node {
     pub fn remove_overriding_pointers(
         &mut self,
         pager: Rc<RefCell<Pager>>,
+        key_size: usize,
+        row_size: usize,
     ) -> anyhow::Result<bool> {
         if !self.is_internal() {
             bail!("remove_overriding_pointers called on Leaf node")
         }
-        let right_pointer_key = Node::try_from(
-            pager
-                .borrow_mut()
-                .get_page(self.internal_right_pointer()?.0)?,
-        )?
+        let right_pointer_key = Node::try_from(pager.borrow_mut().get_page(
+            self.internal_right_pointer()?.0,
+            key_size,
+            row_size,
+        )?)?
         .max_key();
         if self.max_key() == right_pointer_key {
             self.pop();
@@ -341,9 +358,11 @@ impl Node {
         &self,
         self_page_num: u32,
         pager: Rc<RefCell<Pager>>,
+        key_size: usize,
+        row_size: usize,
     ) -> anyhow::Result<()> {
         for Pointer(pointer) in self.children_pointers()? {
-            let pointer_page = pager.borrow_mut().get_page(pointer)?;
+            let pointer_page = pager.borrow_mut().get_page(pointer, key_size, row_size)?;
             let mut node = Node::try_from(pointer_page.clone())?;
             node.parent = Some(self_page_num);
             pointer_page.borrow_mut().data = node.try_into()?;
@@ -371,6 +390,8 @@ impl Node {
         }
     }
 }
+
+const POINTER_SIZE: usize = 4;
 
 impl TryFrom<Page> for Node {
     type Error = anyhow::Error;
@@ -402,16 +423,16 @@ impl TryFrom<Page> for Node {
                 right_child = Pointer(
                     pointer_from_bytes(&data, offset).context("could not right_child pointer")?,
                 );
-                offset += LEAF_NODE_KEY_SIZE;
+                offset += POINTER_SIZE;
 
                 for _ in 0..num_cells {
                     let pointer = Pointer(
                         pointer_from_bytes(&data, offset)
                             .context("could not parse child pointer")?,
                     );
-                    offset += LEAF_NODE_KEY_SIZE;
-                    let key = data[offset..offset + LEAF_NODE_KEY_SIZE].to_vec();
-                    offset += LEAF_NODE_KEY_SIZE;
+                    offset += POINTER_SIZE;
+                    let key = data[offset..offset + value.key_size].to_vec();
+                    offset += value.key_size;
 
                     child_pointer_pairs.push((pointer, Key(key)));
                 }
@@ -424,6 +445,7 @@ impl TryFrom<Page> for Node {
                     is_root,
                     is_index,
                     parent,
+                    value.key_size,
                     value.row_size,
                 ))
             }
@@ -438,7 +460,7 @@ impl TryFrom<Page> for Node {
                         value => Some(Pointer(value)),
                     };
 
-                offset += LEAF_NODE_KEY_SIZE;
+                offset += POINTER_SIZE;
 
                 let row_size = if is_index {
                     LEAF_INDEX_NODE_CELL_SIZE
@@ -446,8 +468,11 @@ impl TryFrom<Page> for Node {
                     value.row_size
                 };
                 for _ in 0..num_cells {
-                    let key = data[offset..offset + LEAF_NODE_KEY_SIZE].to_vec();
-                    offset += LEAF_NODE_KEY_SIZE;
+                    if offset == 4154 || offset + value.key_size == 4154 {
+                        dbg!("hee");
+                    }
+                    let key = data[offset..offset + value.key_size].to_vec();
+                    offset += value.key_size;
                     let data = value.get_ptr_from_offset(offset, row_size);
                     offset += row_size;
                     kvs.push((Key(key), data.to_vec()));
@@ -458,6 +483,7 @@ impl TryFrom<Page> for Node {
                     is_root,
                     is_index,
                     parent,
+                    value.key_size,
                     value.row_size,
                 ))
             }
@@ -494,22 +520,20 @@ impl TryFrom<Node> for [u8; PAGE_SIZE] {
                 right_child,
                 child_pointer_pairs,
             } => {
-                buf[offset..offset + LEAF_NODE_KEY_SIZE]
-                    .copy_from_slice(&right_child.0.to_be_bytes());
-                offset += LEAF_NODE_KEY_SIZE;
+                buf[offset..offset + POINTER_SIZE].copy_from_slice(&right_child.0.to_be_bytes());
+                offset += POINTER_SIZE;
 
                 for (pointer, Key(key)) in child_pointer_pairs {
-                    buf[offset..offset + LEAF_NODE_KEY_SIZE]
-                        .copy_from_slice(&pointer.0.to_be_bytes());
-                    offset += LEAF_NODE_KEY_SIZE;
-                    buf[offset..offset + LEAF_NODE_KEY_SIZE].copy_from_slice(&key);
-                    offset += LEAF_NODE_KEY_SIZE;
+                    buf[offset..offset + POINTER_SIZE].copy_from_slice(&pointer.0.to_be_bytes());
+                    offset += POINTER_SIZE;
+                    buf[offset..offset + POINTER_SIZE].copy_from_slice(&key);
+                    offset += POINTER_SIZE;
                 }
             }
             NodeType::Leaf { kvs, next_leaf } => {
-                buf[offset..offset + LEAF_NODE_KEY_SIZE]
+                buf[offset..offset + POINTER_SIZE]
                     .copy_from_slice(&next_leaf.unwrap_or_default().0.to_be_bytes());
-                offset += LEAF_NODE_KEY_SIZE;
+                offset += POINTER_SIZE;
 
                 let row_size = if val.is_index {
                     LEAF_INDEX_NODE_CELL_SIZE
@@ -518,8 +542,9 @@ impl TryFrom<Node> for [u8; PAGE_SIZE] {
                 };
 
                 for (Key(key), v) in kvs {
-                    buf[offset..offset + LEAF_NODE_KEY_SIZE].copy_from_slice(&key);
-                    offset += LEAF_NODE_KEY_SIZE;
+                    dbg!(val.key_size, &key);
+                    buf[offset..offset + val.key_size].copy_from_slice(&key);
+                    offset += val.key_size;
                     buf[offset..offset + row_size].copy_from_slice(&v);
                     offset += row_size;
                 }
@@ -532,7 +557,7 @@ impl TryFrom<Node> for [u8; PAGE_SIZE] {
 
 fn pointer_from_bytes(data: &[u8], offset: usize) -> anyhow::Result<u32> {
     let value = u32::from_be_bytes(
-        data[offset..offset + LEAF_NODE_KEY_SIZE]
+        data[offset..offset + POINTER_SIZE]
             .try_into()
             .with_context(|| {
                 format!(

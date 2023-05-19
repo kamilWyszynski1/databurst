@@ -1,16 +1,13 @@
 use anyhow::{anyhow, bail, Context};
 use std::{
-    cell::RefCell,
-    collections::{HashMap, HashSet},
-    fmt::Debug,
-    marker::PhantomData,
-    path::Path,
-    rc::Rc,
+    cell::RefCell, collections::HashMap, fmt::Debug, marker::PhantomData, path::Path, rc::Rc,
     str::from_utf8,
 };
 
 use crate::{
-    constants::{EMAIL_OFFSET, ID_OFFSET, USERNAME_OFFSET},
+    constants::{
+        EMAIL_OFFSET, ID_OFFSET, LEAF_INDEX_NODE_CELL_SIZE, LEAF_NODE_KEY_SIZE, USERNAME_OFFSET,
+    },
     cursor::{Cursor, OperationInfo},
     node::{Key, Node, NodeType},
     pager::Pager,
@@ -219,6 +216,9 @@ impl Deserialize for RowID {
     }
 }
 
+type SafePager = Rc<RefCell<Pager>>;
+
+// TODO: these should be stored somehow
 #[derive(Debug)]
 pub struct Indexes {
     /// Set of columns names to be indexed and their page numbers.
@@ -236,7 +236,7 @@ impl Default for Indexes {
 #[derive(Debug)]
 pub struct Table<K, V> {
     pub root_page_num: u32,
-    pub pager: Rc<RefCell<Pager>>,
+    pub pager: SafePager,
 
     /// Describes table's schema.
     //TODO: add in constructor and validate if definition has 'id' column.
@@ -249,12 +249,12 @@ pub struct Table<K, V> {
 
 impl<K, V> Table<K, V> {
     pub fn new<P: AsRef<Path>>(p: P, table_definition: TableDefinition) -> anyhow::Result<Self> {
-        let mut pager = Pager::new(p, table_definition.size())?;
+        let mut pager = Pager::new(p)?;
 
         if pager.num_pages == 0 {
             // new database, need to initialize
             {
-                let root = pager.get_page(0)?;
+                let root = pager.get_page(0, LEAF_NODE_KEY_SIZE, table_definition.size())?;
                 let node = Node::new(
                     NodeType::Leaf {
                         kvs: vec![],
@@ -263,14 +263,17 @@ impl<K, V> Table<K, V> {
                     true,
                     false,
                     None,
+                    LEAF_NODE_KEY_SIZE,
                     table_definition.size(),
                 );
                 root.borrow_mut().data = node.try_into()?;
             }
 
             {
+                // TODO: share writer to a file, do not open another one
                 // index root page num is saved in Indexes as default for 'id' column
-                let index_root = pager.get_page(1)?;
+                let index_root =
+                    pager.get_page(1, LEAF_NODE_KEY_SIZE, LEAF_INDEX_NODE_CELL_SIZE)?;
                 let node = Node::new(
                     NodeType::Leaf {
                         kvs: vec![],
@@ -279,7 +282,8 @@ impl<K, V> Table<K, V> {
                     true,
                     true,
                     None,
-                    8,
+                    LEAF_NODE_KEY_SIZE,
+                    LEAF_INDEX_NODE_CELL_SIZE,
                 );
                 index_root.borrow_mut().data = node.try_into()?;
             }
@@ -296,7 +300,7 @@ impl<K, V> Table<K, V> {
 
     /// Reads table definition, root and index page from file.
     pub fn db_open<P: AsRef<Path> + Clone>(p: P) -> anyhow::Result<Self> {
-        let mut pager = Pager::new(p.clone(), 0)?;
+        let mut pager = Pager::new(p.clone())?;
 
         let table_definition = pager
             .read_table_definition()?
@@ -305,14 +309,29 @@ impl<K, V> Table<K, V> {
         Self::new(p, table_definition)
     }
 
+    fn column_byte_size(&self, column: &str) -> Option<usize> {
+        self.table_definition
+            .columns
+            .iter()
+            .find(|c| c.name == column)
+            .map(|c| c.column_type.byte_size())
+    }
+
     // TODO: implement updating index when data already exist.
     fn add_indexed_column(&mut self, column: String) -> anyhow::Result<()> {
         if self.indexes.columns.contains_key(&column) {
             return Ok(());
         }
+        let column_size = self
+            .column_byte_size(&column)
+            .context("could not find column in TableDefinition")?;
 
         let index_page_num = self.pager.borrow_mut().get_unused_page_num();
-        let index_page = self.pager.borrow_mut().get_page(index_page_num)?;
+        let index_page = self.pager.borrow_mut().get_page(
+            index_page_num,
+            column_size,
+            LEAF_INDEX_NODE_CELL_SIZE,
+        )?;
         let node = Node::new(
             NodeType::Leaf {
                 kvs: vec![],
@@ -321,7 +340,8 @@ impl<K, V> Table<K, V> {
             true,
             true,
             None,
-            8,
+            column_size,
+            LEAF_INDEX_NODE_CELL_SIZE,
         );
         index_page.borrow_mut().data = node.try_into()?;
 
@@ -350,7 +370,8 @@ impl<K, V> Table<K, V> {
                     let index_columns = self.indexes.columns.clone(); // TODO: refactor
                     for (index_column, index_page_num) in index_columns {
                         if index_column == "id" {
-                            let cursor = self.cursor_find(index_page_num, &key)?;
+                            let cursor =
+                                self.cursor_find(index_page_num, &key, LEAF_NODE_KEY_SIZE)?;
                             cursor.insert(key.clone(), &row_id.serialize())?;
                         } else {
                             unimplemented!()
@@ -379,8 +400,11 @@ impl<K, V> Table<K, V> {
 
     /// Return the position of the given key.
     /// If the key is not present, return the position where it should be inserted.
-    fn cursor_find(&mut self, page_num: u32, key: &Key) -> anyhow::Result<Cursor> {
-        let root_page = self.pager.borrow_mut().get_page(page_num)?;
+    fn cursor_find(&mut self, page_num: u32, key: &Key, row_size: usize) -> anyhow::Result<Cursor> {
+        let root_page = self
+            .pager
+            .borrow_mut()
+            .get_page(page_num, key.0.len(), row_size)?;
         let root_node = Node::try_from(root_page.borrow().clone())?;
         let mut cursor = Cursor::new(self.pager.clone(), page_num, 0);
 
@@ -394,7 +418,7 @@ impl<K, V> Table<K, V> {
                     .unwrap_or_else(|x| x);
 
                 if inx == child_pointer_pairs.len() {
-                    self.cursor_find(right_child.0, key)
+                    self.cursor_find(right_child.0, key, row_size)
                 } else {
                     self.cursor_find(
                         child_pointer_pairs
@@ -403,6 +427,7 @@ impl<K, V> Table<K, V> {
                             .0
                              .0,
                         key,
+                        row_size,
                     )
                 }
             }
@@ -435,17 +460,33 @@ where
     V: Deserialize,
 {
     pub fn search_with_where(&mut self, where_stmt: WhereStmt) -> anyhow::Result<Option<Vec<V>>> {
-        let index = self.get_column_index(&where_stmt.column);
-        let mut cursor = match index {
+        let mut cursor = match self.column_index(&where_stmt.column) {
             Some(page_num) => {
-                dbg!("index found");
-                self.cursor_find(page_num, &where_stmt.value.clone().into())
-            }
-            None => self.cursor_start(),
-        }?;
+                // indexed column
+                let index_cursor = self.cursor_find(
+                    page_num,
+                    &where_stmt.value.clone().into(),
+                    LEAF_INDEX_NODE_CELL_SIZE,
+                )?;
+                let key_size = self
+                    .column_byte_size(&where_stmt.column)
+                    .context("could not get column byte size")?;
 
-        // perform sequential scan
-        let data = cursor.select_by(where_stmt.get_cmp(&self.table_definition)?)?;
+                // try to use index
+                match self.index_cursor_to_row_cursor(index_cursor, key_size)? {
+                    Some(cursor) => cursor,
+                    None => self.cursor_start()?, // sequential scan
+                }
+            }
+            None => self.cursor_start()?, // sequential scan
+        };
+
+        // find data
+        let data = cursor.select_by(
+            where_stmt.get_cmp(&self.table_definition)?,
+            LEAF_NODE_KEY_SIZE,
+            self.table_definition.size(),
+        )?;
         if data.is_empty() {
             return Ok(None);
         }
@@ -458,29 +499,48 @@ where
 
     /// Searches for particular saved row.
     pub fn search(&mut self, key: Key) -> anyhow::Result<Option<V>> {
-        let index_cursor = self.cursor_find(1, &key)?;
-        let row_cursor = match index_cursor.data()? {
-            Some(data) => {
-                let index = RowID::deserialize(&data)?;
-                Cursor::new(self.pager.clone(), index.page_num, index.cell_num)
-            }
-            None => self.cursor_find(self.root_page_num, &key)?,
+        let index_cursor = self.cursor_find(1, &key, LEAF_INDEX_NODE_CELL_SIZE)?;
+        let row_cursor = match self.index_cursor_to_row_cursor(index_cursor, key.0.len())? {
+            Some(cursor) => cursor,
+            None => self.cursor_find(self.root_page_num, &key, self.table_definition.size())?,
         };
 
-        Ok(match row_cursor.data()? {
-            Some(data) => Some(V::deserialize(&data)?),
-            None => None,
-        })
+        Ok(
+            match row_cursor.data(key.0.len(), self.table_definition.size())? {
+                Some(data) => Some(V::deserialize(&data)?),
+                None => None,
+            },
+        )
     }
 
-    fn get_column_index(&self, column: &str) -> Option<u32> {
+    /// Converts index cursor to row cursor by extracting saved RowID.
+    fn index_cursor_to_row_cursor(
+        &mut self,
+        index_cursor: Cursor,
+        key_size: usize,
+    ) -> anyhow::Result<Option<Cursor>> {
+        match index_cursor.data(key_size, LEAF_INDEX_NODE_CELL_SIZE)? {
+            Some(data) => {
+                let index = RowID::deserialize(&data)?;
+                Ok(Some(Cursor::new(
+                    self.pager.clone(),
+                    index.page_num,
+                    index.cell_num,
+                )))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn column_index(&self, column: &str) -> Option<u32> {
         self.indexes.columns.get(column).copied()
     }
 
     pub fn collect(&mut self) -> anyhow::Result<Vec<V>> {
         let mut cursor = self.cursor_start()?;
 
-        let data = cursor.select()?;
+        // TODO: refactor
+        let data = cursor.select(LEAF_NODE_KEY_SIZE, self.table_definition.size())?;
 
         Ok(data
             .into_iter()
@@ -492,7 +552,11 @@ where
     fn print(&self, page_num: u32, ident: String) -> anyhow::Result<()> {
         use crate::node::Pointer;
 
-        let node = Node::try_from(self.pager.borrow_mut().get_page(page_num)?)?;
+        let node = Node::try_from(self.pager.borrow_mut().get_page(
+            page_num,
+            LEAF_NODE_KEY_SIZE,
+            self.table_definition.size(),
+        )?)?;
 
         match node.node_type {
             NodeType::Internal {
@@ -572,13 +636,13 @@ where
         let page = self
             .pager
             .borrow_mut()
-            .get_page(self.root_page_num)
+            .get_page(self.root_page_num, key.0.len(), data.len())
             .with_context(|| format!("could not read {} page", self.root_page_num))?;
         let node =
             Node::try_from(page.borrow().clone()).context("could not create Node from Page")?;
 
         let num_cells = node.num_cells();
-        let cursor = self.cursor_find(self.root_page_num, &key)?;
+        let cursor = self.cursor_find(self.root_page_num, &key, data.len())?;
 
         if cursor.cell_num < num_cells {
             if let Some(key_at_index) = node.leaf_node_key(cursor.cell_num)? {
@@ -587,7 +651,7 @@ where
                 }
             }
         }
-        // cursor.insert(key, &data)?;
+
         match cursor.insert(key.clone(), &data)? {
             OperationInfo::Insert {
                 split_occurred,
@@ -595,12 +659,18 @@ where
             } => {
                 if split_occurred {
                     let metadata = metadata.context("SplitMetadata should be filled")?;
-                    let left_node =
-                        Node::try_from(self.pager.borrow_mut().get_page(metadata.new_left)?)?;
+                    let left_node = Node::try_from(self.pager.borrow_mut().get_page(
+                        metadata.new_left,
+                        key.0.len(),
+                        data.len(),
+                    )?)?;
                     self.update_index_for_node(metadata.new_left, left_node)?;
 
-                    let right_node =
-                        Node::try_from(self.pager.borrow_mut().get_page(metadata.new_right)?)?;
+                    let right_node = Node::try_from(self.pager.borrow_mut().get_page(
+                        metadata.new_right,
+                        key.0.len(),
+                        data.len(),
+                    )?)?;
                     self.update_index_for_node(metadata.new_right, right_node)?;
                 } else {
                     let row_id = RowID {
@@ -616,7 +686,7 @@ where
                             .clone()
                             .into();
 
-                        self.cursor_find(index_page_num, &indexed_key)?
+                        self.cursor_find(index_page_num, &indexed_key, LEAF_INDEX_NODE_CELL_SIZE)?
                             .insert(indexed_key, &row_id.serialize())?;
                     }
                 }
@@ -1094,6 +1164,7 @@ mod tests {
         db.add_indexed_column("username".to_string())?;
 
         for row in rows {
+            dbg!("lol");
             db.insert(row.into())?;
         }
 

@@ -16,13 +16,21 @@ use std::{
 #[derive(Debug, Clone)]
 pub struct Page {
     pub data: [u8; PAGE_SIZE],
+
+    /// Amount of bytes that row's key takes. It is dynamical because indexes' keys can be arbitrary values like strings.
+    pub key_size: usize,
+    /// Amount of bytes that row "body" takes.
     pub row_size: usize,
 }
 
 impl Page {
-    pub fn new(row_size: usize) -> Self {
+    pub fn new(key_size: usize, row_size: usize) -> Self {
+        if key_size == 276 {
+            dbg!("panic");
+        }
         Self {
             data: [0; PAGE_SIZE],
+            key_size,
             row_size,
         }
     }
@@ -42,6 +50,7 @@ impl TryFrom<Node> for Page {
 
     fn try_from(value: Node) -> anyhow::Result<Self, Self::Error> {
         Ok(Self {
+            key_size: value.key_size,
             row_size: value.row_size,
             data: value.try_into()?,
         })
@@ -54,12 +63,10 @@ pub struct Pager {
     pub file_len: u32,
     pub num_pages: u32,
     pub pages_rc: [Option<Rc<RefCell<Page>>>; TABLE_MAX_PAGES],
-
-    row_size: usize,
 }
 
 impl Pager {
-    pub fn new<P: AsRef<Path>>(p: P, row_size: usize) -> anyhow::Result<Self> {
+    pub fn new<P: AsRef<Path>>(p: P) -> anyhow::Result<Self> {
         let f = OpenOptions::new()
             .write(true)
             .read(true)
@@ -81,7 +88,6 @@ impl Pager {
             file_len,
             num_pages,
             pages_rc: [INIT; TABLE_MAX_PAGES],
-            row_size,
         })
     }
 
@@ -91,7 +97,12 @@ impl Pager {
         self.num_pages
     }
 
-    pub fn get_page(&mut self, page_num: u32) -> anyhow::Result<Rc<RefCell<Page>>> {
+    pub fn get_page(
+        &mut self,
+        page_num: u32,
+        key_size: usize,
+        row_size: usize,
+    ) -> anyhow::Result<Rc<RefCell<Page>>> {
         if page_num as usize > TABLE_MAX_PAGES {
             bail!(
                 "tried to fetch pager number out of bounds: {} > {}",
@@ -124,12 +135,12 @@ impl Pager {
             reader.take(PAGE_SIZE as u64).read_to_end(&mut buf)?;
 
             // let's split page into chunks
-            let mut page = Page::new(self.row_size);
+            let mut page = Page::new(key_size, row_size);
             page.data = vector_to_array(buf)?;
 
             page
         } else {
-            Page::new(self.row_size)
+            Page::new(key_size, row_size)
         };
 
         let p = Rc::new(RefCell::new(page));
