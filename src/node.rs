@@ -518,9 +518,6 @@ impl TryFrom<Node> for [u8; PAGE_SIZE] {
                 };
 
                 for (Key(key), v) in kvs {
-                    if offset + LEAF_NODE_KEY_SIZE == 4098 {
-                        println!("here")
-                    }
                     buf[offset..offset + LEAF_NODE_KEY_SIZE].copy_from_slice(&key);
                     offset += LEAF_NODE_KEY_SIZE;
                     buf[offset..offset + row_size].copy_from_slice(&v);

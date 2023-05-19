@@ -220,9 +220,9 @@ impl Deserialize for RowID {
 }
 
 #[derive(Debug)]
-struct Indexes {
+pub struct Indexes {
     /// Set of columns names to be indexed and their page numbers.
-    columns: HashMap<String, u32>,
+    pub columns: HashMap<String, u32>,
 }
 
 impl Default for Indexes {
@@ -341,13 +341,21 @@ impl<K, V> Table<K, V> {
             NodeType::Leaf { kvs, next_leaf: _ } => {
                 // TODO: if there are indexes on different columns that 'id' we need to divide
                 // data bytes into proper 'keys' to use them in indexing
-                for (cell_num, (key, _)) in kvs.into_iter().enumerate() {
+                for (cell_num, (key, data)) in kvs.into_iter().enumerate() {
                     let row_id = RowID {
                         page_num,
                         cell_num: cell_num as u32,
                     };
-                    let cursor = self.cursor_find(self.root_index_num, &key)?;
-                    cursor.insert(key, &row_id.serialize())?;
+
+                    let index_columns = self.indexes.columns.clone(); // TODO: refactor
+                    for (index_column, index_page_num) in index_columns {
+                        if index_column == "id" {
+                            let cursor = self.cursor_find(index_page_num, &key)?;
+                            cursor.insert(key.clone(), &row_id.serialize())?;
+                        } else {
+                            unimplemented!()
+                        }
+                    }
                 }
             }
         }
@@ -427,7 +435,14 @@ where
     V: Deserialize,
 {
     pub fn search_with_where(&mut self, where_stmt: WhereStmt) -> anyhow::Result<Option<Vec<V>>> {
-        let mut cursor = self.cursor_start()?;
+        let index = self.get_column_index(&where_stmt.column);
+        let mut cursor = match index {
+            Some(page_num) => {
+                dbg!("index found");
+                self.cursor_find(page_num, &where_stmt.value.clone().into())
+            }
+            None => self.cursor_start(),
+        }?;
 
         // perform sequential scan
         let data = cursor.select_by(where_stmt.get_cmp(&self.table_definition)?)?;
@@ -456,6 +471,10 @@ where
             Some(data) => Some(V::deserialize(&data)?),
             None => None,
         })
+    }
+
+    fn get_column_index(&self, column: &str) -> Option<u32> {
+        self.indexes.columns.get(column).copied()
     }
 
     pub fn collect(&mut self) -> anyhow::Result<Vec<V>> {
@@ -589,7 +608,8 @@ where
                         cell_num: cursor.cell_num,
                     };
 
-                    for (index_column, index_page_num) in self.indexes.columns {
+                    let index_columns = self.indexes.columns.clone(); //TODO: refactor
+                    for (index_column, index_page_num) in index_columns {
                         let indexed_key: Key = values
                             .get(&index_column)
                             .context("there's no indexed column in values")?
@@ -1071,6 +1091,7 @@ mod tests {
                 ],
             },
         )?;
+        db.add_indexed_column("username".to_string())?;
 
         for row in rows {
             db.insert(row.into())?;
