@@ -22,6 +22,7 @@ pub enum OperationInfo {
     Replace,
 }
 
+#[derive(Clone)]
 pub struct Cursor {
     pager: Rc<RefCell<Pager>>,
     pub page_num: u32,
@@ -60,18 +61,18 @@ impl Cursor {
             LEAF_NODE_SPACE_FOR_CELLS / leaf_node_cells_size
         };
 
-        // check if cell_num is already occupied, if key matches, replace value
-        if let NodeType::Leaf { kvs, next_leaf: _ } = &mut node.node_type {
-            if let Some((existing_key, existing_data)) = kvs.get_mut(self.cell_num as usize) {
-                if *existing_key == key {
-                    // replace and return
-                    *existing_data = data.to_vec();
-                    // turn node back into bytes
-                    page.borrow_mut().data = node.try_into()?;
-                    return Ok(OperationInfo::Replace);
-                }
-            }
-        }
+        // // check if cell_num is already occupied, if key matches, replace value
+        // if let NodeType::Leaf { kvs, next_leaf: _ } = &mut node.node_type {
+        //     if let Some((existing_key, existing_data)) = kvs.get_mut(self.cell_num as usize) {
+        //         if *existing_key == key {
+        //             // replace and return
+        //             *existing_data = data.to_vec();
+        //             // turn node back into bytes
+        //             page.borrow_mut().data = node.try_into()?;
+        //             return Ok(OperationInfo::Replace);
+        //         }
+        //     }
+        // }
 
         let num_cells = node.num_cells() as usize;
 
@@ -255,13 +256,15 @@ impl Cursor {
                 mut child_pointer_pairs,
             } => {
                 let pointers_len = child_pointer_pairs.len();
-                if (is_index && pointers_len == leaf_node_max_cells)
-                    || (!is_index && pointers_len == leaf_node_max_cells)
-                {
+
+                let index_max_cells = is_index && pointers_len == leaf_node_max_cells;
+                let non_index_max_cells = !is_index && pointers_len == leaf_node_max_cells;
+                if index_max_cells || non_index_max_cells {
                     // find place to insert key
                     let inx = child_pointer_pairs
                         .binary_search_by_key(&&key, |(_, key)| key)
                         .unwrap_or_else(|x| x);
+
                     child_pointer_pairs.insert(inx, (Pointer(self.page_num), key));
 
                     // split
@@ -391,7 +394,7 @@ impl Cursor {
                         let inx = child_pointer_pairs
                             .binary_search_by_key(&&key, |(_, key)| key)
                             .unwrap_or_else(|x| x);
-                        child_pointer_pairs.insert(inx, (Pointer(self.page_num), key));
+                        child_pointer_pairs.insert(inx, (Pointer(right_child_num), key));
                     }
 
                     // update node

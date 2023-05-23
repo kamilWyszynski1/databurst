@@ -468,9 +468,6 @@ impl TryFrom<Page> for Node {
                     value.row_size
                 };
                 for _ in 0..num_cells {
-                    if offset == 4154 || offset + value.key_size == 4154 {
-                        dbg!("hee");
-                    }
                     let key = data[offset..offset + value.key_size].to_vec();
                     offset += value.key_size;
                     let data = value.get_ptr_from_offset(offset, row_size);
@@ -526,8 +523,8 @@ impl TryFrom<Node> for [u8; PAGE_SIZE] {
                 for (pointer, Key(key)) in child_pointer_pairs {
                     buf[offset..offset + POINTER_SIZE].copy_from_slice(&pointer.0.to_be_bytes());
                     offset += POINTER_SIZE;
-                    buf[offset..offset + POINTER_SIZE].copy_from_slice(&key);
-                    offset += POINTER_SIZE;
+                    buf[offset..offset + val.key_size].copy_from_slice(&key);
+                    offset += val.key_size;
                 }
             }
             NodeType::Leaf { kvs, next_leaf } => {
@@ -542,7 +539,6 @@ impl TryFrom<Node> for [u8; PAGE_SIZE] {
                 };
 
                 for (Key(key), v) in kvs {
-                    dbg!(val.key_size, &key);
                     buf[offset..offset + val.key_size].copy_from_slice(&key);
                     offset += val.key_size;
                     buf[offset..offset + row_size].copy_from_slice(&v);

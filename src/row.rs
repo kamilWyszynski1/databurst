@@ -72,6 +72,29 @@ impl TableDefinition {
     pub fn size(&self) -> usize {
         self.columns.iter().map(|c| c.column_type.byte_size()).sum()
     }
+
+    pub fn column_byte_range(&self, column: &str) -> anyhow::Result<(usize, usize)> {
+        let mut offset = 0;
+        let mut size = 0;
+        let mut found = false;
+
+        for c in &self.columns {
+            size = c.column_type.byte_size();
+            if c.name == column {
+                found = true;
+                break;
+            }
+            offset += c.column_type.byte_size();
+        }
+
+        if !found {
+            bail!(
+                "invalid WhereStmt, could not find '{}' column in TableDefinition",
+                column
+            )
+        }
+        Ok((offset, offset + size))
+    }
 }
 
 impl TryFrom<Vec<u8>> for TableDefinition {

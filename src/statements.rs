@@ -1,7 +1,6 @@
-use anyhow::bail;
-
 use crate::row::TableDefinition;
 
+#[derive(Debug, Clone)]
 pub struct WhereStmt {
     pub column: String,
     pub value: Vec<u8>,
@@ -12,30 +11,13 @@ impl WhereStmt {
         mut self,
         td: &TableDefinition,
     ) -> anyhow::Result<Box<dyn Fn(&Vec<u8>) -> bool>> {
-        let mut offset = 0;
-        let mut size = 0;
-        let mut found = false;
+        let (from, to) = td.column_byte_range(&self.column)?;
 
-        for c in &td.columns {
-            size = c.column_type.byte_size();
-            if c.name == self.column {
-                found = true;
-                break;
-            }
-            offset += c.column_type.byte_size();
-        }
-
-        if !found {
-            bail!(
-                "invalid WhereStmt, could not find '{}' column in TableDefinition",
-                self.column
-            )
-        }
-
-        self.value.append(&mut vec![0u8; size - self.value.len()]);
+        self.value
+            .append(&mut vec![0u8; to - from - self.value.len()]);
 
         Ok(Box::new(move |v: &Vec<u8>| -> bool {
-            let part = v[offset..offset + size].to_vec();
+            let part = v[from..to].to_vec();
             part == self.value
         }))
     }
