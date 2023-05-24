@@ -139,7 +139,9 @@ impl Cursor {
             // All existing keys plus new key should be divided evenly between old (left) and new (right) nodes.
             if let NodeType::Leaf { mut kvs, next_leaf } = left_node.node_type.clone() {
                 kvs.insert(self.cell_num as usize, (key, data.to_vec()));
-                let siblings_kvs = kvs.split_off((kvs.len() + 1) / 2);
+
+                let split_inx = find_index_to_split(&kvs)?;
+                let siblings_kvs = kvs.split_off(split_inx);
 
                 let mut left_node = Node::new(
                     NodeType::Leaf {
@@ -261,20 +263,43 @@ impl Cursor {
                 let non_index_max_cells = !is_index && pointers_len == leaf_node_max_cells;
                 if index_max_cells || non_index_max_cells {
                     // find place to insert key
+
+                    // TODO: shift pointers here if we insert in the front or middle, take a look here
+                    // it should be : ([(10, "aaaa"), (17, "aaaaaaaa"), (9, "aaaaaaaaaaaaaa")], key Pointer(15))
+                    /*
+                    83(2) internal [root: true, inx: true, parent: ] ([(17, "aaaa"), (10, "aaaaaaaa"), (9, "aaaaaaaaaaaaaa")], key Pointer(15))
+                        (17) leaf: [parent: 2, inx: true](kvs: ["\"aaaa\" -> (16, 13)", "\"aaaa\" -> (6, 2)", "\"aaaa\" -> (11, 1)", "\"aaaa\" -> (6, 2)", "\"aaaa\" -> (5, 9)", "\"aaaa\" -> (4, 3)", "\"aaaa\" -> (0, 3)", "\"aaaaa\" -> (5, 10)", "\"aaaaa\" -> (6, 3)", "\"aaaaa\" -> (11, 2)", "\"aaaaa\" -> (13, 8)", "\"aaaaa\" -> (14, 1)", "\"aaaaa\" -> (8, 9)", "\"aaaaa\" -> (14, 1)", "\"aaaaa\" -> (11, 2)", "\"aaaaa\" -> (6, 3)", "\"aaaaa\" -> (4, 4)", "\"aaaaa\" -> (0, 4)", "\"aaaaaa\" -> (4, 5)", "\"aaaaaa\" -> (6, 4)", "\"aaaaaa\" -> (6, 4)", "\"aaaaaa\" -> (8, 10)", "\"aaaaaa\" -> (11, 3)", "\"aaaaaa\" -> (13, 9)", "\"aaaaaa\" -> (14, 2)", "\"aaaaaa\" -> (14, 2)", "\"aaaaaa\" -> (11, 3)", "\"aaaaaa\" -> (5, 11)", "\"aaaaaa\" -> (0, 5)", "\"aaaaaaa\" -> (4, 6)", "\"aaaaaaa\" -> (5, 12)", "\"aaaaaaa\" -> (8, 11)", "\"aaaaaaa\" -> (11, 4)", "\"aaaaaaa\" -> (6, 5)", "\"aaaaaaa\" -> (6, 5)", "\"aaaaaaa\" -> (11, 4)", "\"aaaaaaa\" -> (13, 10)", "\"aaaaaaa\" -> (14, 3)", "\"aaaaaaa\" -> (14, 3)", "\"aaaaaaa\" -> (0, 6)", "\"aaaaaaaa\" -> (11, 5)", "\"aaaaaaaa\" -> (5, 13)", "\"aaaaaaaa\" -> (3, 0)", "\"aaaaaaaa\" -> (6, 6)", "\"aaaaaaaa\" -> (13, 11)", "\"aaaaaaaa\" -> (14, 4)", "\"aaaaaaaa\" -> (14, 4)", "\"aaaaaaaa\" -> (11, 5)", "\"aaaaaaaa\" -> (8, 12)", "\"aaaaaaaa\" -> (6, 6)", "\"aaaaaaaa\" -> (3, 0)", "\"aaaaaaaa\" -> (0, 7)"] next_leaf: Some(Pointer(9)))
+                        (10) leaf: [parent: 2, inx: true](kvs: ["\"\" -> (5, 5)", "\"\" -> (5, 5)", "\"\" -> (8, 4)", "\"\" -> (8, 4)", "\"\" -> (13, 3)", "\"\" -> (13, 3)", "\"\" -> (16, 9)", "\"\" -> (12, 10)", "\"\" -> (7, 11)", "\"\" -> (3, 12)", "\"a\" -> (5, 6)", "\"a\" -> (13, 4)", "\"a\" -> (16, 10)", "\"a\" -> (13, 4)", "\"a\" -> (8, 5)", "\"a\" -> (12, 11)", "\"a\" -> (8, 5)", "\"a\" -> (4, 0)", "\"a\" -> (7, 12)", "\"a\" -> (5, 6)", "\"a\" -> (3, 13)", "\"a\" -> (0, 0)", "\"aa\" -> (8, 6)", "\"aa\" -> (13, 5)", "\"aa\" -> (13, 5)", "\"aa\" -> (16, 11)", "\"aa\" -> (8, 6)", "\"aa\" -> (12, 12)", "\"aa\" -> (5, 7)", "\"aa\" -> (6, 0)", "\"aa\" -> (7, 13)", "\"aa\" -> (6, 0)", "\"aa\" -> (4, 1)", "\"aa\" -> (0, 1)", "\"aaa\" -> (11, 0)", "\"aaa\" -> (13, 6)", "\"aaa\" -> (13, 6)", "\"aaa\" -> (8, 7)", "\"aaa\" -> (16, 12)", "\"aaa\" -> (11, 0)", "\"aaa\" -> (12, 13)", "\"aaa\" -> (6, 1)", "\"aaa\" -> (6, 1)", "\"aaa\" -> (5, 8)", "\"aaa\" -> (4, 2)", "\"aaa\" -> (0, 2)", "\"aaaa\" -> (8, 8)", "\"aaaa\" -> (13, 7)", "\"aaaa\" -> (14, 0)", "\"aaaa\" -> (11, 1)", "\"aaaa\" -> (14, 0)"] next_leaf: Some(Pointer(17)))
+                        (9) leaf: [parent: 2, inx: true](kvs: ["\"aaaaaaaaa\" -> (3, 1)", "\"aaaaaaaaa\" -> (7, 0)", "\"aaaaaaaaa\" -> (7, 0)", "\"aaaaaaaaa\" -> (8, 13)", "\"aaaaaaaaa\" -> (11, 6)", "\"aaaaaaaaa\" -> (11, 6)", "\"aaaaaaaaa\" -> (14, 5)", "\"aaaaaaaaa\" -> (14, 5)", "\"aaaaaaaaa\" -> (13, 12)", "\"aaaaaaaaa\" -> (6, 7)", "\"aaaaaaaaa\" -> (3, 1)", "\"aaaaaaaaa\" -> (0, 8)", "\"aaaaaaaaaa\" -> (12, 0)", "\"aaaaaaaaaa\" -> (14, 6)", "\"aaaaaaaaaa\" -> (14, 6)", "\"aaaaaaaaaa\" -> (12, 0)", "\"aaaaaaaaaa\" -> (13, 13)", "\"aaaaaaaaaa\" -> (11, 7)", "\"aaaaaaaaaa\" -> (3, 2)", "\"aaaaaaaaaa\" -> (6, 8)", "\"aaaaaaaaaa\" -> (7, 1)", "\"aaaaaaaaaa\" -> (7, 1)", "\"aaaaaaaaaa\" -> (3, 2)", "\"aaaaaaaaaa\" -> (0, 9)", "\"aaaaaaaaaaa\" -> (7, 2)", "\"aaaaaaaaaaa\" -> (6, 9)", "\"aaaaaaaaaaa\" -> (12, 1)", "\"aaaaaaaaaaa\" -> (14, 7)", "\"aaaaaaaaaaa\" -> (16, 0)", "\"aaaaaaaaaaa\" -> (12, 1)", "\"aaaaaaaaaaa\" -> (11, 8)", "\"aaaaaaaaaaa\" -> (3, 3)", "\"aaaaaaaaaaa\" -> (3, 3)", "\"aaaaaaaaaaa\" -> (7, 2)", "\"aaaaaaaaaaa\" -> (0, 10)", "\"aaaaaaaaaaaa\" -> (3, 4)", "\"aaaaaaaaaaaa\" -> (7, 3)", "\"aaaaaaaaaaaa\" -> (7, 3)", "\"aaaaaaaaaaaa\" -> (3, 4)", "\"aaaaaaaaaaaa\" -> (12, 2)", "\"aaaaaaaaaaaa\" -> (11, 9)", "\"aaaaaaaaaaaa\" -> (12, 2)", "\"aaaaaaaaaaaa\" -> (14, 8)", "\"aaaaaaaaaaaa\" -> (6, 10)", "\"aaaaaaaaaaaa\" -> (16, 1)", "\"aaaaaaaaaaaa\" -> (0, 11)", "\"aaaaaaaaaaaaa\" -> (7, 4)", "\"aaaaaaaaaaaaa\" -> (3, 5)", "\"aaaaaaaaaaaaa\" -> (11, 10)", "\"aaaaaaaaaaaaa\" -> (12, 3)", "\"aaaaaaaaaaaaa\" -> (6, 11)", "\"aaaaaaaaaaaaa\" -> (14, 9)", "\"aaaaaaaaaaaaa\" -> (16, 2)", "\"aaaaaaaaaaaaa\" -> (7, 4)", "\"aaaaaaaaaaaaa\" -> (3, 5)", "\"aaaaaaaaaaaaa\" -> (12, 3)", "\"aaaaaaaaaaaaa\" -> (0, 12)", "\"aaaaaaaaaaaaaa\" -> (16, 3)", "\"aaaaaaaaaaaaaa\" -> (12, 4)", "\"aaaaaaaaaaaaaa\" -> (14, 10)", "\"aaaaaaaaaaaaaa\" -> (11, 11)"] next_leaf: Some(Pointer(15)))
+                        (15) leaf: [parent: 2, inx: true](kvs: ["\"aaaaaaaaaaaaaa\" -> (3, 6)", "\"aaaaaaaaaaaaaa\" -> (7, 5)", "\"aaaaaaaaaaaaaa\" -> (7, 5)", "\"aaaaaaaaaaaaaa\" -> (12, 4)", "\"aaaaaaaaaaaaaa\" -> (3, 6)", "\"aaaaaaaaaaaaaa\" -> (6, 12)", "\"aaaaaaaaaaaaaa\" -> (0, 13)", "\"aaaaaaaaaaaaaaa\" -> (7, 6)", "\"aaaaaaaaaaaaaaa\" -> (7, 6)", "\"aaaaaaaaaaaaaaa\" -> (12, 5)", "\"aaaaaaaaaaaaaaa\" -> (12, 5)", "\"aaaaaaaaaaaaaaa\" -> (5, 0)", "\"aaaaaaaaaaaaaaa\" -> (11, 12)", "\"aaaaaaaaaaaaaaa\" -> (16, 4)", "\"aaaaaaaaaaaaaaa\" -> (14, 11)", "\"aaaaaaaaaaaaaaa\" -> (6, 13)", "\"aaaaaaaaaaaaaaa\" -> (5, 0)", "\"aaaaaaaaaaaaaaa\" -> (3, 7)", "\"aaaaaaaaaaaaaaaa\" -> (5, 1)", "\"aaaaaaaaaaaaaaaa\" -> (7, 7)", "\"aaaaaaaaaaaaaaaa\" -> (11, 13)", "\"aaaaaaaaaaaaaaaa\" -> (16, 5)", "\"aaaaaaaaaaaaaaaa\" -> (14, 12)", "\"aaaaaaaaaaaaaaaa\" -> (8, 0)", "\"aaaaaaaaaaaaaaaa\" -> (5, 1)", "\"aaaaaaaaaaaaaaaa\" -> (12, 6)", "\"aaaaaaaaaaaaaaaa\" -> (12, 6)", "\"aaaaaaaaaaaaaaaa\" -> (8, 0)", "\"aaaaaaaaaaaaaaaa\" -> (3, 8)", "\"aaaaaaaaaaaaaaaaa\" -> (14, 13)", "\"aaaaaaaaaaaaaaaaa\" -> (13, 0)", "\"aaaaaaaaaaaaaaaaa\" -> (5, 2)", "\"aaaaaaaaaaaaaaaaa\" -> (8, 1)", "\"aaaaaaaaaaaaaaaaa\" -> (7, 8)", "\"aaaaaaaaaaaaaaaaa\" -> (12, 7)", "\"aaaaaaaaaaaaaaaaa\" -> (13, 0)", "\"aaaaaaaaaaaaaaaaa\" -> (16, 6)", "\"aaaaaaaaaaaaaaaaa\" -> (8, 1)", "\"aaaaaaaaaaaaaaaaa\" -> (5, 2)", "\"aaaaaaaaaaaaaaaaa\" -> (3, 9)", "\"aaaaaaaaaaaaaaaaaa\" -> (5, 3)", "\"aaaaaaaaaaaaaaaaaa\" -> (8, 2)", "\"aaaaaaaaaaaaaaaaaa\" -> (12, 8)", "\"aaaaaaaaaaaaaaaaaa\" -> (13, 1)", "\"aaaaaaaaaaaaaaaaaa\" -> (16, 7)", "\"aaaaaaaaaaaaaaaaaa\" -> (13, 1)", "\"aaaaaaaaaaaaaaaaaa\" -> (8, 2)", "\"aaaaaaaaaaaaaaaaaa\" -> (7, 9)", "\"aaaaaaaaaaaaaaaaaa\" -> (5, 3)", "\"aaaaaaaaaaaaaaaaaa\" -> (3, 10)", "\"aaaaaaaaaaaaaaaaaaa\" -> (5, 4)", "\"aaaaaaaaaaaaaaaaaaa\" -> (13, 2)", "\"aaaaaaaaaaaaaaaaaaa\" -> (16, 8)", "\"aaaaaaaaaaaaaaaaaaa\" -> (13, 2)", "\"aaaaaaaaaaaaaaaaaaa\" -> (12, 9)", "\"aaaaaaaaaaaaaaaaaaa\" -> (8, 3)", "\"aaaaaaaaaaaaaaaaaaa\" -> (8, 3)", "\"aaaaaaaaaaaaaaaaaaa\" -> (7, 10)", "\"aaaaaaaaaaaaaaaaaaa\" -> (5, 4)", "\"aaaaaaaaaaaaaaaaaaa\" -> (3, 11)"] next_leaf: None)
+                    */
                     let inx = child_pointer_pairs
                         .binary_search_by_key(&&key, |(_, key)| key)
                         .unwrap_or_else(|x| x);
 
-                    child_pointer_pairs.insert(inx, (Pointer(self.page_num), key));
+                    if inx == child_pointer_pairs.len() && right_child_num > right_child.0 {
+                        child_pointer_pairs.insert(inx, (right_child, key));
+                        right_child = Pointer(right_child_num);
+                    } else {
+                        child_pointer_pairs.insert(inx, (Pointer(right_child_num), key));
+                    }
 
+                    let split_inx = find_index_to_split(&child_pointer_pairs)?;
                     // split
-                    let siblings = child_pointer_pairs.split_off((pointers_len + 1) / 2);
+                    let siblings = child_pointer_pairs.split_off(split_inx);
                     // find max pointer-key pair in left child
                     let (max_pointer, max_left) = child_pointer_pairs
                         .clone()
                         .into_iter()
                         .max_by_key(|(_, key)| key.clone())
                         .context("cannot find max")?;
+                    let (min_pointer, min_left) = siblings
+                        .clone()
+                        .into_iter()
+                        .min_by_key(|(_, key)| key.clone())
+                        .context("cannot find max")?;
+
+                    dbg!(&max_pointer, &max_left, &min_pointer, &min_left);
 
                     let new_page_num = self.pager.borrow().get_unused_page_num();
                     let new_page =
@@ -421,6 +446,32 @@ impl Cursor {
         Ok(())
     }
 
+    pub fn select_by_key<F>(
+        &mut self,
+        mut cmp: F,
+        key_size: usize,
+        row_size: usize,
+    ) -> anyhow::Result<Vec<Vec<u8>>>
+    where
+        F: FnMut(&Vec<u8>) -> bool,
+    {
+        let mut data = vec![];
+
+        select_all(
+            self.pager.clone(),
+            self.page_num,
+            |_, _, Key(key), bytes| {
+                if cmp(&key) {
+                    data.push(bytes)
+                }
+            },
+            key_size,
+            row_size,
+        )?;
+
+        Ok(data)
+    }
+
     pub fn select_by<F>(
         &mut self,
         mut cmp: F,
@@ -487,6 +538,40 @@ impl Cursor {
     }
 }
 
+// /// Searches for median value first, then find first occurrence - this will be our index.
+// fn find_index_to_split(values: &Vec<(Pointer, Key)>) -> anyhow::Result<usize> {
+//     let mid = values.len() / 2;
+//     let median_key = values
+//         .get(mid)
+//         .context("could not get median value")?
+//         .1
+//         .clone();
+//     let (inx, _) = values
+//         .iter()
+//         .enumerate()
+//         .map(|(i, (_, k))| (i, k))
+//         .find(|(_, k)| *k == &median_key)
+//         .context("could not get inx of median value")?;
+//     Ok(inx)
+// }
+
+/// Searches for median value first, then find first occurrence - this will be our index.
+fn find_index_to_split<T, V: Clone + PartialEq>(values: &Vec<(T, V)>) -> anyhow::Result<usize> {
+    let mid = values.len() / 2;
+    let median_key = values
+        .get(mid)
+        .context("could not get median value")?
+        .1
+        .clone();
+    let (inx, _) = values
+        .iter()
+        .enumerate()
+        .map(|(i, (_, k))| (i, k))
+        .find(|(_, k)| *k == &median_key)
+        .context("could not get inx of median value")?;
+    Ok(inx)
+}
+
 fn select_all<F: FnMut(u32, u32, Key, Vec<u8>)>(
     pager: Rc<RefCell<Pager>>,
     page_num: u32,
@@ -502,18 +587,12 @@ fn select_all<F: FnMut(u32, u32, Key, Vec<u8>)>(
             right_child: _,
             child_pointer_pairs,
         } => {
-            // go to the lowest leaf, then we will use `next_leaf` field to traverse all leafs
-            select_all(
-                pager,
-                child_pointer_pairs
-                    .get(0)
-                    .context("could not get first child in internal node")?
-                    .0
-                     .0,
-                f,
-                key_size,
-                row_size,
-            )?;
+            let (Pointer(p), _) = child_pointer_pairs
+                .iter()
+                .min_by_key(|(p, key)| key)
+                .context("minimum pointer could not be cound")?;
+            // go to the lowest, to the left leaf, then we will use `next_leaf` field to traverse all leafs
+            select_all(pager, *p, f, key_size, row_size)?;
         }
         NodeType::Leaf { kvs, next_leaf } => {
             for (inx, (key, row_bytes)) in kvs.into_iter().enumerate() {

@@ -450,18 +450,11 @@ impl<K, V> Table<K, V> {
                     self.cursor_find(page_from_child, key, row_size)
                 }
             }
-            NodeType::Leaf { kvs, next_leaf } => {
+            NodeType::Leaf { kvs, next_leaf: _ } => {
                 let inx = kvs
                     .binary_search_by_key(&key, |(k, _)| k)
                     .unwrap_or_else(|x| x);
-                if inx == kvs.len() {
-                    // not found matching value
-                    if let Some(Pointer(leaf)) = next_leaf {
-                        return self.cursor_find(leaf, key, row_size);
-                    }
-                } else {
-                    cursor.cell_num = inx as u32;
-                }
+                cursor.cell_num = inx as u32;
 
                 Ok(cursor)
             }
@@ -547,49 +540,92 @@ where
     V: Deserialize,
 {
     pub fn search_with_where(&mut self, where_stmt: WhereStmt) -> anyhow::Result<Option<Vec<V>>> {
-        let mut cursor = match self.column_index(&where_stmt.column) {
+        let key_size = self
+            .column_byte_size(&where_stmt.column)
+            .context("column size not found")?;
+
+        let mut cursors: Vec<Cursor> = match self.column_index(&where_stmt.column) {
             Some(page_num) => {
                 // prepare where_stmt value
-                let colum_size = self
-                    .column_byte_size(&where_stmt.column)
-                    .context("column size not found")?;
 
                 let mut where_value = where_stmt.value.clone();
-                where_value.append(&mut vec![0u8; colum_size - where_stmt.value.len()]);
+                where_value.append(&mut vec![0u8; key_size - where_stmt.value.len()]);
 
-                // indexed column
-                let index_cursor = self.cursor_find(
-                    page_num,
-                    &where_stmt.value.clone().into(),
-                    LEAF_INDEX_NODE_CELL_SIZE,
-                )?;
-                let key_size = self
-                    .column_byte_size(&where_stmt.column)
-                    .context("could not get column byte size")?;
+                let mut index_cursor = Cursor::new(self.pager.clone(), page_num, 0);
+                let rowIDs: Vec<RowID> = index_cursor
+                    .select_by_key(
+                        |key: &Vec<u8>| -> bool {
+                            {
+                                key == &where_value
+                            }
+                        },
+                        where_value.len(),
+                        LEAF_INDEX_NODE_CELL_SIZE,
+                    )?
+                    .into_iter()
+                    .map(|v| RowID::deserialize(&v).unwrap())
+                    .collect();
 
-                // try to use index
-                match self.index_cursor_to_row_cursor(index_cursor, key_size)? {
-                    Some(cursor) => cursor,
-                    None => self.cursor_start()?, // sequential scan
-                }
+                // // indexed column
+                // let index_cursor =
+                //     self.cursor_find(page_num, &where_value.into(), LEAF_INDEX_NODE_CELL_SIZE)?;
+                // let key_size = self
+                //     .column_byte_size(&where_stmt.column)
+                //     .context("could not get column byte size")?;
+
+                // // try to use index
+                // match self.index_cursor_to_row_cursor(index_cursor, key_size)? {
+                //     Some(cursor) => cursor,
+                //     None => self.cursor_start()?, // sequential scan
+                // }
+                rowIDs
+                    .into_iter()
+                    .map(|r| Cursor::new(self.pager.clone(), r.page_num, r.cell_num))
+                    .collect()
             }
-            None => self.cursor_start()?, // sequential scan
+            None => {
+                // sequential scan
+                // vec![self.cursor_start()?]
+                let data = self.cursor_start()?.select_by(
+                    where_stmt.get_cmp(&self.table_definition)?,
+                    LEAF_NODE_KEY_SIZE,
+                    self.table_definition.size(),
+                )?;
+                if data.is_empty() {
+                    return Ok(None);
+                }
+                let parsed: Vec<V> = data
+                    .into_iter()
+                    .map(|v| V::deserialize(&v).unwrap())
+                    .collect();
+                return Ok(Some(parsed));
+            }
         };
 
-        // find data
-        let data = cursor.select_by(
-            where_stmt.get_cmp(&self.table_definition)?,
-            LEAF_NODE_KEY_SIZE,
-            self.table_definition.size(),
-        )?;
-        if data.is_empty() {
-            return Ok(None);
+        // // find data
+        // let data = cursor.select_by(
+        //     where_stmt.get_cmp(&self.table_definition)?,
+        //     LEAF_NODE_KEY_SIZE,
+        //     self.table_definition.size(),
+        // )?;
+        // if data.is_empty() {
+        //     return Ok(None);
+        // }
+        // let parsed: Vec<V> = data
+        //     .into_iter()
+        //     .map(|v| V::deserialize(&v).unwrap())
+        //     .collect();
+        // Ok(Some(parsed))
+
+        let mut rows: Vec<V> = vec![];
+        for cursor in cursors {
+            rows.push(V::deserialize(
+                &cursor
+                    .data(key_size, self.table_definition.size())?
+                    .context("could not found")?,
+            )?);
         }
-        let parsed: Vec<V> = data
-            .into_iter()
-            .map(|v| V::deserialize(&v).unwrap())
-            .collect();
-        Ok(Some(parsed))
+        Ok(Some(rows))
     }
 
     /// Searches for particular saved row.
@@ -734,8 +770,9 @@ where
         match node.node_type {
             NodeType::Internal {
                 right_child,
-                child_pointer_pairs,
+                mut child_pointer_pairs,
             } => {
+                child_pointer_pairs.sort_by_key(|(_, k)| k.clone());
                 println!(
                     "{ident}({page_num}) internal [root: {}, inx: {}, parent: {}] ({:?}, key {:?})",
                     node.is_root,
@@ -755,7 +792,7 @@ where
             NodeType::Leaf { kvs, next_leaf } => {
                 if node.is_index {
                     println!(
-                        "{ident}({page_num}) leaf: [parent: {}, inx: {}](kvs: {:?}, next_leaf: {:?})",
+                        "{ident}({page_num}) leaf: [parent: {}, inx: {}](kvs: {:?} next_leaf: {:?})",
                         node.parent.map(|x| x.to_string()).unwrap_or_default(),
                         node.is_index,
                         kvs.iter().map(|(Key(key), data)| (V::deserialize_key(key), RowID::deserialize(data).unwrap())).map(|(key, row_id)| format!("{:?} -> ({}, {})", key, row_id.page_num, row_id.cell_num)).collect::<Vec<String>>(),
@@ -763,7 +800,7 @@ where
                     )
                 } else {
                     println!(
-                        "{ident}({page_num}) leaf: [parent: {}, inx: {}](kvs: {:?}, next_leaf: {:?})",
+                        "{ident}({page_num}) leaf: [parent: {}, inx: {}]({:?} next_leaf: {:?})",
                         node.parent.map(|x| x.to_string()).unwrap_or_default(),
                         node.is_index,
                         kvs.iter().map(|(key, _)| key.clone()).collect::<Vec<Key>>(),
@@ -1017,6 +1054,8 @@ mod tests {
         db.insert(r1.into()).context("could not insert r1")?;
         db.insert(r3.into())?;
         db.insert(r2.into())?;
+
+        db.print(1, "".to_string())?;
 
         let got = db.collect()?;
         assert_eq!(wanted, got);
@@ -1345,11 +1384,19 @@ mod tests {
         db.add_indexed_column("username".to_string())?;
 
         for (i, row) in rows.into_iter().enumerate() {
+            if i == 125 {
+                dbg!()
+            }
             db.insert(row.into())?;
+
+            print!("{i}");
+            db.print(2, "".to_string())?;
+            println!();
         }
 
-        db.print(2, "".to_string())?;
-        println!();
+        db.print(0, "".to_string())?;
+
+        // db.print(2, "".to_string())?;
 
         let rows = db
             .search_with_where(WhereStmt {
@@ -1357,6 +1404,12 @@ mod tests {
                 value: str_as_bytes("a".repeat(4).as_str()),
             })?
             .context("rows should be found")?;
+        // let rows = db
+        //     .search_with_where(WhereStmt {
+        //         column: "id".to_string(),
+        //         value: 199u32.to_be_bytes().to_vec(),
+        //     })?
+        //     .context("rows should be found")?;
 
         assert_eq!(22, rows.len());
 
