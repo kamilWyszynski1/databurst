@@ -369,7 +369,6 @@ impl<K, V> Table<K, V> {
     fn update_index_for_node(&mut self, page_num: u32, node: Node) -> anyhow::Result<()> {
         match node.node_type {
             NodeType::Internal {
-                right_child: _,
                 child_pointer_pairs: _,
             } => {
                 bail!("could not update index for Interal node");
@@ -433,23 +432,21 @@ impl<K, V> Table<K, V> {
 
         match root_node.node_type {
             NodeType::Internal {
-                right_child,
                 child_pointer_pairs,
             } => {
-                let inx = child_pointer_pairs
+                let mut inx = child_pointer_pairs
                     .binary_search_by_key(&key, |(_, k)| k)
                     .unwrap_or_else(|x| x);
 
-                if inx == child_pointer_pairs.len() {
-                    self.cursor_find(right_child.0, key, row_size)
-                } else {
-                    let page_from_child = child_pointer_pairs
-                        .get(inx)
-                        .context("could not get value by index after binary search")?
-                        .0
-                         .0;
-                    self.cursor_find(page_from_child, key, row_size)
+                if inx >= child_pointer_pairs.len() {
+                    inx = child_pointer_pairs.len() - 1;
                 }
+                let page_from_child = child_pointer_pairs
+                    .get(inx)
+                    .context("could not get value by index after binary search")?
+                    .0
+                     .0;
+                self.cursor_find(page_from_child, key, row_size)
             }
             NodeType::Leaf { kvs, next_leaf: _ } => {
                 let inx = kvs
@@ -477,23 +474,18 @@ impl<K, V> Table<K, V> {
 
         match root_node.node_type {
             NodeType::Internal {
-                right_child,
                 child_pointer_pairs,
             } => {
                 let inx = child_pointer_pairs
                     .binary_search_by_key(&key, |(_, k)| k)
                     .unwrap_or_else(|x| x);
 
-                if inx == child_pointer_pairs.len() {
-                    self.multiple_cursor_find(right_child.0, key, row_size)
-                } else {
-                    let page_from_child = child_pointer_pairs
-                        .get(inx)
-                        .context("could not get value by index after binary search")?
-                        .0
-                         .0;
-                    self.multiple_cursor_find(page_from_child, key, row_size)
-                }
+                let page_from_child = child_pointer_pairs
+                    .get(inx)
+                    .context("could not get value by index after binary search")?
+                    .0
+                     .0;
+                self.multiple_cursor_find(page_from_child, key, row_size)
             }
             NodeType::Leaf { kvs, next_leaf: _ } => {
                 let cells: Vec<usize> = kvs
@@ -600,28 +592,13 @@ where
             }
         };
 
-        // // find data
-        // let data = cursor.select_by(
-        //     where_stmt.get_cmp(&self.table_definition)?,
-        //     LEAF_NODE_KEY_SIZE,
-        //     self.table_definition.size(),
-        // )?;
-        // if data.is_empty() {
-        //     return Ok(None);
-        // }
-        // let parsed: Vec<V> = data
-        //     .into_iter()
-        //     .map(|v| V::deserialize(&v).unwrap())
-        //     .collect();
-        // Ok(Some(parsed))
-
         let mut rows: Vec<V> = vec![];
         for cursor in cursors {
-            rows.push(V::deserialize(
-                &cursor
-                    .data(key_size, self.table_definition.size())?
-                    .context("could not found")?,
-            )?);
+            dbg!(&cursor);
+            match cursor.data(key_size, self.table_definition.size())? {
+                Some(data) => rows.push(V::deserialize(&data)?),
+                None => eprintln!("could not find"),
+            }
         }
         Ok(Some(rows))
     }
@@ -704,8 +681,6 @@ where
 
     #[cfg(test)]
     fn print_short(&self, page_num: u32, ident: String) -> anyhow::Result<()> {
-        use crate::node::Pointer;
-
         let node = Node::try_from(self.pager.borrow_mut().get_page(
             page_num,
             LEAF_NODE_KEY_SIZE,
@@ -720,16 +695,14 @@ where
 
         match node.node_type {
             NodeType::Internal {
-                right_child,
                 child_pointer_pairs,
             } => {
                 print!(
-                    " ({:?}, key {:?})",
+                    " ({:?})",
                     child_pointer_pairs
                         .iter()
                         .map(|(Pointer(pointer), key)| (*pointer, V::deserialize_key(&key.0)))
                         .collect::<Vec<(u32, String)>>(),
-                    right_child
                 );
             }
             NodeType::Leaf { kvs, next_leaf } => {
@@ -757,8 +730,6 @@ where
 
     #[cfg(test)]
     fn print(&self, page_num: u32, ident: String) -> anyhow::Result<()> {
-        use crate::node::Pointer;
-
         let node = Node::try_from(self.pager.borrow_mut().get_page(
             page_num,
             LEAF_NODE_KEY_SIZE,
@@ -767,12 +738,11 @@ where
 
         match node.node_type {
             NodeType::Internal {
-                right_child,
                 mut child_pointer_pairs,
             } => {
                 child_pointer_pairs.sort_by_key(|(_, k)| k.clone());
                 println!(
-                    "{ident}({page_num}) internal [root: {}, inx: {}, parent: {}] ({:?}, key {:?})",
+                    "{ident}({page_num}) internal [root: {}, inx: {}, parent: {}] ({:?})",
                     node.is_root,
                     node.is_index,
                     node.parent.map(|x| x.to_string()).unwrap_or_default(),
@@ -780,12 +750,10 @@ where
                         .iter()
                         .map(|(Pointer(pointer), key)| (*pointer, V::deserialize_key(&key.0)))
                         .collect::<Vec<(u32, String)>>(),
-                    right_child
                 );
                 for (pointer, _) in child_pointer_pairs {
                     self.print(pointer.0, format!(" {}", ident))?;
                 }
-                self.print(right_child.0, format!(" {}", ident))?;
             }
             NodeType::Leaf { kvs, next_leaf } => {
                 if node.is_index {
@@ -1334,9 +1302,13 @@ mod tests {
             },
         )?;
 
-        for row in rows {
+        for (i, row) in rows.into_iter().enumerate() {
+            if i == 15 {
+                dbg!(i);
+            }
             db.insert(row.into())?;
         }
+        db.print_short(0, "".to_string())?;
 
         let rows = db
             .search_with_where(WhereStmt {
@@ -1382,15 +1354,8 @@ mod tests {
         db.add_indexed_column("username".to_string())?;
 
         for (i, row) in rows.into_iter().enumerate() {
-            if i == 42 {}
             db.insert(row.into())?;
-
-            print!("{i}");
-            db.print(2, "".to_string())?;
-            println!();
         }
-
-        db.print(2, "".to_string())?;
 
         let rows = db
             .search_with_where(WhereStmt {
