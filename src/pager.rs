@@ -25,9 +25,7 @@ pub struct Page {
 
 impl Page {
     pub fn new(key_size: usize, row_size: usize) -> Self {
-        if key_size == 276 {
-            dbg!("panic");
-        }
+        if key_size == 276 {}
         Self {
             data: [0; PAGE_SIZE],
             key_size,

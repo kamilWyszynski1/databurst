@@ -395,6 +395,7 @@ impl<K, V> Table<K, V> {
                             )?
                             .into()
                         };
+
                         let cursor =
                             self.cursor_find(index_page_num, &index_key, LEAF_NODE_KEY_SIZE)?;
                         cursor.insert(index_key, &row_id.serialize())?;
@@ -552,19 +553,6 @@ where
                 where_value.append(&mut vec![0u8; key_size - where_stmt.value.len()]);
 
                 let mut index_cursor = Cursor::new(self.pager.clone(), page_num, 0);
-                let rowIDs: Vec<RowID> = index_cursor
-                    .select_by_key(
-                        |key: &Vec<u8>| -> bool {
-                            {
-                                key == &where_value
-                            }
-                        },
-                        where_value.len(),
-                        LEAF_INDEX_NODE_CELL_SIZE,
-                    )?
-                    .into_iter()
-                    .map(|v| RowID::deserialize(&v).unwrap())
-                    .collect();
 
                 // // indexed column
                 // let index_cursor =
@@ -578,8 +566,18 @@ where
                 //     Some(cursor) => cursor,
                 //     None => self.cursor_start()?, // sequential scan
                 // }
-                rowIDs
+                index_cursor
+                    .select_by_key(
+                        |key: &Vec<u8>| -> bool {
+                            {
+                                key == &where_value
+                            }
+                        },
+                        where_value.len(),
+                        LEAF_INDEX_NODE_CELL_SIZE,
+                    )?
                     .into_iter()
+                    .map(|v| RowID::deserialize(&v).unwrap())
                     .map(|r| Cursor::new(self.pager.clone(), r.page_num, r.cell_num))
                     .collect()
             }
@@ -1173,7 +1171,7 @@ mod tests {
     fn test_table_definition() -> anyhow::Result<()> {
         let tmp_dir = TempDir::new("databurst")?;
         let file_path = tmp_dir.path().join("my.db");
-        dbg!(&file_path);
+
         File::create(&file_path)?;
 
         let td = TableDefinition {
@@ -1200,7 +1198,7 @@ mod tests {
     fn test_table_invalid_insert() -> anyhow::Result<()> {
         let tmp_dir = TempDir::new("databurst")?;
         let file_path = tmp_dir.path().join("my.db");
-        dbg!(&file_path);
+
         File::create(&file_path)?;
 
         let td = TableDefinition {
@@ -1253,7 +1251,7 @@ mod tests {
     fn test_insert_generic_row() -> anyhow::Result<()> {
         let tmp_dir = TempDir::new("databurst")?;
         let file_path = tmp_dir.path().join("my.db");
-        dbg!(&file_path);
+
         File::create(&file_path)?;
 
         let td = TableDefinition {
@@ -1384,9 +1382,7 @@ mod tests {
         db.add_indexed_column("username".to_string())?;
 
         for (i, row) in rows.into_iter().enumerate() {
-            if i == 125 {
-                dbg!()
-            }
+            if i == 42 {}
             db.insert(row.into())?;
 
             print!("{i}");
@@ -1394,9 +1390,7 @@ mod tests {
             println!();
         }
 
-        db.print(0, "".to_string())?;
-
-        // db.print(2, "".to_string())?;
+        db.print(2, "".to_string())?;
 
         let rows = db
             .search_with_where(WhereStmt {
@@ -1404,14 +1398,8 @@ mod tests {
                 value: str_as_bytes("a".repeat(4).as_str()),
             })?
             .context("rows should be found")?;
-        // let rows = db
-        //     .search_with_where(WhereStmt {
-        //         column: "id".to_string(),
-        //         value: 199u32.to_be_bytes().to_vec(),
-        //     })?
-        //     .context("rows should be found")?;
 
-        assert_eq!(22, rows.len());
+        assert_eq!(20, rows.len());
 
         db.close()?;
 

@@ -137,10 +137,10 @@ impl Cursor {
 
         {
             // All existing keys plus new key should be divided evenly between old (left) and new (right) nodes.
-            if let NodeType::Leaf { mut kvs, next_leaf } = left_node.node_type.clone() {
+            if let NodeType::Leaf { mut kvs, next_leaf } = left_node.node_type {
                 kvs.insert(self.cell_num as usize, (key, data.to_vec()));
 
-                let split_inx = find_index_to_split(&kvs)?;
+                let split_inx = find_index_to_split_by_key(&kvs)?;
                 let siblings_kvs = kvs.split_off(split_inx);
 
                 let mut left_node = Node::new(
@@ -166,7 +166,7 @@ impl Cursor {
                     row_size,
                 );
 
-                let left_child_max_key = left_node.max_key();
+                let max_key = left_node.max_key();
                 if is_root {
                     // root page has to stay as it was, because of that we need to allocate another page
                     // copy content and change that page data
@@ -175,16 +175,13 @@ impl Cursor {
                         self.pager
                             .borrow_mut()
                             .get_page(new_left_page_num, key_size, row_size)?;
-                    new_left_page.borrow_mut().data = left_page.borrow().data; // clone data
+                    new_left_page.borrow_mut().data = left_node.clone().try_into()?; // clone data
 
                     // split the root
                     let root = Node::new(
                         NodeType::Internal {
                             right_child: Pointer(right_page_num),
-                            child_pointer_pairs: vec![(
-                                Pointer(new_left_page_num),
-                                left_child_max_key,
-                            )],
+                            child_pointer_pairs: vec![(Pointer(new_left_page_num), max_key)],
                         },
                         true,
                         is_index,
@@ -208,12 +205,7 @@ impl Cursor {
                     left_node.save(left_page_num, self.pager.clone(), key_size, row_size)?;
                     right_node.save(right_page_num, self.pager.clone(), key_size, row_size)?;
 
-                    self.insert_into_internal(
-                        page_num,
-                        right_page_num,
-                        left_child_max_key,
-                        data.len(),
-                    )?;
+                    self.insert_into_internal(page_num, right_page_num, max_key, data.len())?;
                 }
             } else {
                 panic!("node is not a Leaf")
@@ -284,7 +276,7 @@ impl Cursor {
                         child_pointer_pairs.insert(inx, (Pointer(right_child_num), key));
                     }
 
-                    let split_inx = find_index_to_split(&child_pointer_pairs)?;
+                    let split_inx = find_index_to_split_by_value(&child_pointer_pairs)?;
                     // split
                     let siblings = child_pointer_pairs.split_off(split_inx);
                     // find max pointer-key pair in left child
@@ -293,13 +285,6 @@ impl Cursor {
                         .into_iter()
                         .max_by_key(|(_, key)| key.clone())
                         .context("cannot find max")?;
-                    let (min_pointer, min_left) = siblings
-                        .clone()
-                        .into_iter()
-                        .min_by_key(|(_, key)| key.clone())
-                        .context("cannot find max")?;
-
-                    dbg!(&max_pointer, &max_left, &min_pointer, &min_left);
 
                     let new_page_num = self.pager.borrow().get_unused_page_num();
                     let new_page =
@@ -401,18 +386,14 @@ impl Cursor {
                         self.insert_into_internal(parent, new_page_num, max_left, row_size)?;
                     }
                 } else {
-                    if key
-                        >= child_pointer_pairs
-                            .last()
-                            .context("there's no last item")?
-                            .1
-                    {
-                        let right_child_key = Node::try_from(self.pager.borrow_mut().get_page(
-                            right_child.0,
-                            key_size,
-                            row_size,
-                        )?)?
-                        .max_key();
+                    let right_child_key = Node::try_from(self.pager.borrow_mut().get_page(
+                        right_child.0,
+                        key_size,
+                        row_size,
+                    )?)?
+                    .max_key();
+
+                    if key > right_child_key {
                         child_pointer_pairs.push((right_child, right_child_key));
                         right_child = Pointer(right_child_num);
                     } else {
@@ -538,25 +519,10 @@ impl Cursor {
     }
 }
 
-// /// Searches for median value first, then find first occurrence - this will be our index.
-// fn find_index_to_split(values: &Vec<(Pointer, Key)>) -> anyhow::Result<usize> {
-//     let mid = values.len() / 2;
-//     let median_key = values
-//         .get(mid)
-//         .context("could not get median value")?
-//         .1
-//         .clone();
-//     let (inx, _) = values
-//         .iter()
-//         .enumerate()
-//         .map(|(i, (_, k))| (i, k))
-//         .find(|(_, k)| *k == &median_key)
-//         .context("could not get inx of median value")?;
-//     Ok(inx)
-// }
-
 /// Searches for median value first, then find first occurrence - this will be our index.
-fn find_index_to_split<T, V: Clone + PartialEq>(values: &Vec<(T, V)>) -> anyhow::Result<usize> {
+fn find_index_to_split_by_value<T, V: Clone + PartialEq>(
+    values: &Vec<(T, V)>,
+) -> anyhow::Result<usize> {
     let mid = values.len() / 2;
     let median_key = values
         .get(mid)
@@ -569,6 +535,31 @@ fn find_index_to_split<T, V: Clone + PartialEq>(values: &Vec<(T, V)>) -> anyhow:
         .map(|(i, (_, k))| (i, k))
         .find(|(_, k)| *k == &median_key)
         .context("could not get inx of median value")?;
+    Ok(inx)
+}
+
+fn find_index_to_split_by_key<T: Clone + PartialEq, V>(
+    values: &Vec<(T, V)>,
+) -> anyhow::Result<usize> {
+    let mid = (values.len() + 1) / 2;
+    let median = values
+        .get(mid)
+        .context("could not get median value")?
+        .0
+        .clone();
+
+    let (inx, _) = values
+        .iter()
+        .enumerate()
+        .map(|(i, (v, _))| (i, v))
+        .find(|(_, v)| *v == &median)
+        .context("could not get inx of median value")?;
+
+    if inx == 0 {
+        // it means that all elements are equal
+        return Ok(values.len() / 2);
+    }
+
     Ok(inx)
 }
 

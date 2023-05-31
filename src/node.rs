@@ -135,7 +135,7 @@ pub enum NodeType {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Node {
     pub node_type: NodeType,
     pub is_root: bool,
