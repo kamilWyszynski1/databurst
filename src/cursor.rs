@@ -1,6 +1,6 @@
 use std::{cell::RefCell, rc::Rc};
 
-use anyhow::{bail, Context, Ok};
+use anyhow::{bail, Context};
 
 use crate::{
     constants::LEAF_NODE_SPACE_FOR_CELLS,
@@ -9,6 +9,7 @@ use crate::{
 };
 
 pub struct SplitMetadata {
+    pub old: u32,
     pub new_left: u32,
     pub new_right: u32,
 }
@@ -131,6 +132,8 @@ impl Cursor {
             .borrow_mut()
             .get_page(right_page_num, key_size, row_size)?; // allocate page
 
+        let mut old_page = left_page_num;
+
         let is_root = left_node.is_root;
         let is_index = left_node.is_index;
 
@@ -199,7 +202,9 @@ impl Cursor {
                     left_node.save(new_left_page_num, self.pager.clone(), key_size, row_size)?;
                     right_node.save(right_page_num, self.pager.clone(), key_size, row_size)?;
 
-                    left_page_num = new_left_page_num; // change for SplitMetadata
+                    // change for SplitMetadata
+                    old_page = left_page_num;
+                    left_page_num = new_left_page_num;
                 } else {
                     // update leaf's parent
                     let page_num = left_node.parent.context("no parent")?;
@@ -222,6 +227,7 @@ impl Cursor {
         }
 
         Ok(SplitMetadata {
+            old: old_page,
             new_left: left_page_num,
             new_right: right_page_num,
         })

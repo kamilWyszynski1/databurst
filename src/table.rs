@@ -366,7 +366,12 @@ impl<K, V> Table<K, V> {
         Ok(())
     }
 
-    fn update_index_for_node(&mut self, page_num: u32, node: Node) -> anyhow::Result<()> {
+    fn update_index_for_node(
+        &mut self,
+        old_page_num: u32,
+        page_num: u32,
+        node: Node,
+    ) -> anyhow::Result<()> {
         match node.node_type {
             NodeType::Internal {
                 child_pointer_pairs: _,
@@ -537,6 +542,8 @@ where
             .column_byte_size(&where_stmt.column)
             .context("column size not found")?;
 
+        // TODO: refactor - we can simply find first cursor on the very bottom, then
+        // go to the right till key differs, this way we will get all of needed RowIDs
         let mut cursors: Vec<Cursor> = match self.column_index(&where_stmt.column) {
             Some(page_num) => {
                 // prepare where_stmt value
@@ -594,7 +601,6 @@ where
 
         let mut rows: Vec<V> = vec![];
         for cursor in cursors {
-            dbg!(&cursor);
             match cursor.data(key_size, self.table_definition.size())? {
                 Some(data) => rows.push(V::deserialize(&data)?),
                 None => eprintln!("could not find"),
@@ -809,24 +815,7 @@ where
         }
 
         // ===== INSERT DATA ===== //
-        let page = self
-            .pager
-            .borrow_mut()
-            .get_page(self.root_page_num, key.0.len(), data.len())
-            .with_context(|| format!("could not read {} page", self.root_page_num))?;
-        let node =
-            Node::try_from(page.borrow().clone()).context("could not create Node from Page")?;
-
-        let num_cells = node.num_cells();
         let cursor = self.cursor_find(self.root_page_num, &key, data.len())?;
-
-        if cursor.cell_num < num_cells {
-            // if let Some(key_at_index) = node.leaf_node_key(cursor.cell_num)? {
-            //     if key_at_index == key {
-            //         bail!("duplicate key!")
-            //     }
-            // }
-        }
 
         match cursor.insert(key.clone(), &data)? {
             OperationInfo::Insert {
@@ -835,19 +824,24 @@ where
             } => {
                 if split_occurred {
                     let metadata = metadata.context("SplitMetadata should be filled")?;
+
+                    // We need to go through all of left nodes key-values and *update* indexes.
+                    // We will find every index's value of given key/value from new node,
+                    // and update it with new page+cell values using metadata and order from new nodes.
+
                     let left_node = Node::try_from(self.pager.borrow_mut().get_page(
                         metadata.new_left,
                         key.0.len(),
                         data.len(),
                     )?)?;
-                    self.update_index_for_node(metadata.new_left, left_node)?;
+                    self.update_index_for_node(metadata.old, metadata.new_left, left_node)?;
 
                     let right_node = Node::try_from(self.pager.borrow_mut().get_page(
                         metadata.new_right,
                         key.0.len(),
                         data.len(),
                     )?)?;
-                    self.update_index_for_node(metadata.new_right, right_node)?;
+                    self.update_index_for_node(metadata.old, metadata.new_right, right_node)?;
                 } else {
                     let row_id = RowID {
                         page_num: cursor.page_num,
@@ -1356,6 +1350,8 @@ mod tests {
         for (i, row) in rows.into_iter().enumerate() {
             db.insert(row.into())?;
         }
+
+        db.print_short(1, "".to_string())?;
 
         let rows = db
             .search_with_where(WhereStmt {
