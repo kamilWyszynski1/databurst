@@ -194,4 +194,11 @@ impl Pager {
 
         Ok(Some(TableDefinition::try_from(table_def_bytes.to_vec())?))
     }
+
+    pub fn write_node(&mut self, page_num: u32, node: Node) -> anyhow::Result<()> {
+        self.get_page(page_num, node.key_size, node.row_size)?
+            .try_borrow_mut()?
+            .data = node.try_into()?;
+        Ok(())
+    }
 }

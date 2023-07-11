@@ -1,4 +1,4 @@
-use std::{cell::RefCell, rc::Rc};
+use std::{any, cell::RefCell, rc::Rc};
 
 use crate::{
     constants::{
@@ -118,7 +118,8 @@ impl From<&InternalNodeType> for u8 {
 pub enum NodeType {
     /// Internal nodes contain a vector of pointers to their children and a vector of keys.
     Internal {
-        child_pointer_pairs: Vec<(Pointer, Key)>,
+        children: Vec<Pointer>,
+        keys: Vec<Key>,
     },
 
     Leaf {
@@ -147,7 +148,8 @@ impl From<&Node> for u8 {
     fn from(val: &Node) -> Self {
         match val.node_type {
             NodeType::Internal {
-                child_pointer_pairs: _,
+                keys: _,
+                children: _,
             } => {
                 if val.is_index {
                     0x02
@@ -205,9 +207,7 @@ impl Node {
 
     pub fn is_leaf_node(&self) -> bool {
         match self.node_type {
-            NodeType::Internal {
-                child_pointer_pairs: _,
-            } => false,
+            NodeType::Internal { children, keys } => false,
             NodeType::Leaf {
                 kvs: _,
                 next_leaf: _,
@@ -217,9 +217,7 @@ impl Node {
 
     pub fn leaf_node_value(&self, cell_num: u32) -> anyhow::Result<Option<Vec<u8>>> {
         match self.node_type {
-            NodeType::Internal {
-                child_pointer_pairs: _,
-            } => Ok(None),
+            NodeType::Internal { children, keys } => Ok(None),
             NodeType::Leaf {
                 ref kvs,
                 next_leaf: _,
@@ -234,9 +232,7 @@ impl Node {
 
     pub fn leaf_node_key(&self, cell_num: u32) -> anyhow::Result<Option<Key>> {
         match self.node_type {
-            NodeType::Internal {
-                child_pointer_pairs: _,
-            } => Ok(None),
+            NodeType::Internal { children, keys } => Ok(None),
             NodeType::Leaf {
                 ref kvs,
                 next_leaf: _,
@@ -251,20 +247,16 @@ impl Node {
 
     pub fn num_cells(&self) -> u32 {
         match &self.node_type {
-            NodeType::Internal {
-                child_pointer_pairs,
-            } => child_pointer_pairs.len() as u32,
+            NodeType::Internal { children, keys } => children.len() as u32,
             NodeType::Leaf { kvs, next_leaf: _ } => kvs.len() as u32,
         }
     }
 
     pub fn max_key(&self) -> Key {
         match &self.node_type {
-            NodeType::Internal {
-                child_pointer_pairs,
-            } => child_pointer_pairs
+            NodeType::Internal { children, keys } => keys
                 .iter()
-                .map(|(_, key)| key.clone())
+                .map(|key| key.clone())
                 .last()
                 .unwrap_or_default(),
             NodeType::Leaf { kvs, next_leaf: _ } => kvs
@@ -277,10 +269,9 @@ impl Node {
 
     pub fn pop(&mut self) {
         match &mut self.node_type {
-            NodeType::Internal {
-                child_pointer_pairs,
-            } => {
-                child_pointer_pairs.pop();
+            NodeType::Internal { children, keys } => {
+                keys.pop();
+                children.pop();
             }
             NodeType::Leaf { kvs, next_leaf: _ } => {
                 kvs.pop();
@@ -290,9 +281,7 @@ impl Node {
 
     fn is_internal(&self) -> bool {
         match self.node_type {
-            NodeType::Internal {
-                child_pointer_pairs: _,
-            } => true,
+            NodeType::Internal { children, keys } => true,
             NodeType::Leaf {
                 kvs: _,
                 next_leaf: _,
@@ -320,11 +309,8 @@ impl Node {
     /// Returns internal's node children. Returns error when node's a Leaf.
     pub fn children_pointers(&self) -> anyhow::Result<Vec<Pointer>> {
         match &self.node_type {
-            NodeType::Internal {
-                child_pointer_pairs,
-            } => {
-                let mut pointers: Vec<Pointer> =
-                    child_pointer_pairs.iter().map(|(p, _)| *p).collect();
+            NodeType::Internal { children, keys } => {
+                let mut pointers: Vec<Pointer> = children.iter().map(|p| *p).collect();
 
                 Ok(pointers)
             }
@@ -332,6 +318,65 @@ impl Node {
                 kvs: _,
                 next_leaf: _,
             } => bail!("children_pointers called on Leaf node"),
+        }
+    }
+
+    /// split creates a sibling node from a given node by splitting the node in two around a median.
+    /// split will split the child at b leaving the [0, b-1] keys
+    /// while moving the set of [b, 2b-1] keys to the sibling.
+    pub fn split(&mut self, b: usize, sibling_page_num: u32) -> anyhow::Result<(Key, Self)> {
+        match self.node_type {
+            NodeType::Internal {
+                ref mut children,
+                ref mut keys,
+            } => {
+                // Populate siblings keys.
+                let mut sibling_keys = keys.split_off(b - 1);
+                // Pop median key - to be added to the parent..
+                let median_key = sibling_keys.remove(0);
+                // Populate siblings children.
+                let sibling_children = children.split_off(b);
+                Ok((
+                    median_key,
+                    Node::new(
+                        NodeType::Internal {
+                            children: sibling_children,
+                            keys: sibling_keys,
+                        },
+                        false,
+                        self.is_index,
+                        self.parent.clone(),
+                        self.key_size,
+                        self.row_size,
+                    ),
+                ))
+            }
+            NodeType::Leaf {
+                ref mut kvs,
+                ref mut next_leaf,
+            } => {
+                // Populate siblings pairs.
+                let sibling_kvs = kvs.split_off(b);
+                // Pop median key.
+                let median_pair = kvs.get(b - 1).context("could not get median_pair")?.clone();
+
+                let sibling_node_type = NodeType::Leaf {
+                    kvs: sibling_kvs,
+                    next_leaf: next_leaf.clone(),
+                };
+                *next_leaf = Some(Pointer(sibling_page_num)); // we should point to newly created leaf
+                Ok((
+                    median_pair.0,
+                    Node::new(
+                        sibling_node_type,
+                        false,
+                        self.is_index,
+                        self.parent.clone(),
+                        self.key_size,
+                        self.row_size,
+                    ),
+                ))
+            }
         }
     }
 }
@@ -376,10 +421,11 @@ impl TryFrom<Page> for Node {
                     child_pointer_pairs.push((pointer, Key(key)));
                 }
 
+                let (children, keys): (Vec<Pointer>, Vec<Key>) =
+                    child_pointer_pairs.into_iter().map(|(a, b)| (a, b)).unzip();
+
                 Ok(Self::new(
-                    NodeType::Internal {
-                        child_pointer_pairs,
-                    },
+                    NodeType::Internal { children, keys },
                     is_root,
                     is_index,
                     parent,
@@ -451,9 +497,11 @@ impl TryFrom<Node> for [u8; PAGE_SIZE] {
         let mut offset = LEAF_NODE_HEADER_SIZE;
 
         match val.node_type {
-            NodeType::Internal {
-                child_pointer_pairs,
-            } => {
+            NodeType::Internal { children, keys } => {
+                let child_pointer_pairs = children
+                    .into_iter()
+                    .zip(keys)
+                    .collect::<Vec<(Pointer, Key)>>();
                 for (pointer, Key(key)) in child_pointer_pairs {
                     buf[offset..offset + POINTER_SIZE].copy_from_slice(&pointer.0.to_be_bytes());
                     offset += POINTER_SIZE;

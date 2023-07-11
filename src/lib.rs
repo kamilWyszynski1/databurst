@@ -1,3 +1,4 @@
+mod btree;
 #[allow(dead_code)]
 mod cli;
 mod constants;
