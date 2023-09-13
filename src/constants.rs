@@ -1,10 +1,3 @@
-use crate::table::{ID_SIZE, USERNAME_SIZE};
-
-pub const ID_OFFSET: usize = 0;
-pub const USERNAME_OFFSET: usize = ID_OFFSET + ID_SIZE;
-pub const EMAIL_OFFSET: usize = USERNAME_OFFSET + USERNAME_SIZE;
-// pub const ROWS_SIZE: usize = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE;
-
 pub const TABLE_MAX_PAGES: usize = 500;
 pub const PAGE_SIZE: usize = 4096; // 4KB
 

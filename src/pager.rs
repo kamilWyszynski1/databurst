@@ -1,10 +1,10 @@
+use anyhow::bail;
+
 use crate::{
     constants::{PAGE_SIZE, TABLE_MAX_PAGES},
     node::Node,
     row::{TableDefinition, MAX_TABLE_DEFINITION_SIZE},
-    table::vector_to_array,
 };
-use anyhow::bail;
 use std::{
     cell::RefCell,
     fs::{File, OpenOptions},
@@ -13,6 +13,22 @@ use std::{
     rc::Rc,
 };
 
+pub fn vector_to_array<T, const N: usize>(mut v: Vec<T>) -> anyhow::Result<[T; N]>
+where
+    T: Default,
+{
+    let missing = N
+        .checked_sub(v.len())
+        .ok_or_else(|| anyhow::anyhow!("invalid len of input"))?;
+    v.append(&mut (0..missing).map(|_| T::default()).collect());
+
+    let t: Result<[T; N], _> = v.try_into();
+
+    match t {
+        Ok(t) => Ok(t),
+        Err(_) => bail!("could not convert vector to array"),
+    }
+}
 #[derive(Debug, Clone)]
 pub struct Page {
     pub data: [u8; PAGE_SIZE],
@@ -196,7 +212,8 @@ impl Pager {
     }
 
     pub fn write_node(&mut self, page_num: u32, node: Node) -> anyhow::Result<()> {
-        self.get_page(page_num, node.key_size, node.row_size)?
+        let (key_size, row_size) = (node.key_size, node.row_size);
+        self.get_page(page_num, key_size, row_size)?
             .try_borrow_mut()?
             .data = node.try_into()?;
         Ok(())

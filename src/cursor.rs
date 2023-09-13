@@ -212,7 +212,6 @@ impl Cursor {
                     left_node.save(left_page_num, self.pager.clone(), key_size, row_size)?;
                     right_node.save(right_page_num, self.pager.clone(), key_size, row_size)?;
 
-                    dbg!(right_page_num, &max_key, left_page_num, &left_node_max_key);
                     self.insert_into_internal(
                         page_num,
                         right_page_num,
@@ -388,7 +387,7 @@ impl Cursor {
                         let parent = node
                             .parent
                             .context("internal node which is not root without parent")?;
-                        dbg!(page_num, &old_node_max_key);
+
                         self.insert_into_internal(
                             parent,
                             new_page_num,

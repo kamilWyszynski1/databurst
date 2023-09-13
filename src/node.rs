@@ -34,6 +34,12 @@ impl From<Vec<u8>> for Key {
     }
 }
 
+impl From<&str> for Key {
+    fn from(value: &str) -> Self {
+        Self(value.as_bytes().to_vec())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum InternalNodeType {
     /// Internal nodes contain a vector of pointers to their children and a vector of keys.
@@ -207,7 +213,10 @@ impl Node {
 
     pub fn is_leaf_node(&self) -> bool {
         match self.node_type {
-            NodeType::Internal { children, keys } => false,
+            NodeType::Internal {
+                children: _,
+                keys: _,
+            } => false,
             NodeType::Leaf {
                 kvs: _,
                 next_leaf: _,
@@ -217,7 +226,10 @@ impl Node {
 
     pub fn leaf_node_value(&self, cell_num: u32) -> anyhow::Result<Option<Vec<u8>>> {
         match self.node_type {
-            NodeType::Internal { children, keys } => Ok(None),
+            NodeType::Internal {
+                children: _,
+                keys: _,
+            } => Ok(None),
             NodeType::Leaf {
                 ref kvs,
                 next_leaf: _,
@@ -232,7 +244,10 @@ impl Node {
 
     pub fn leaf_node_key(&self, cell_num: u32) -> anyhow::Result<Option<Key>> {
         match self.node_type {
-            NodeType::Internal { children, keys } => Ok(None),
+            NodeType::Internal {
+                children: _,
+                keys: _,
+            } => Ok(None),
             NodeType::Leaf {
                 ref kvs,
                 next_leaf: _,
@@ -247,14 +262,14 @@ impl Node {
 
     pub fn num_cells(&self) -> u32 {
         match &self.node_type {
-            NodeType::Internal { children, keys } => children.len() as u32,
+            NodeType::Internal { children, keys: _ } => children.len() as u32,
             NodeType::Leaf { kvs, next_leaf: _ } => kvs.len() as u32,
         }
     }
 
     pub fn max_key(&self) -> Key {
         match &self.node_type {
-            NodeType::Internal { children, keys } => keys
+            NodeType::Internal { children: _, keys } => keys
                 .iter()
                 .map(|key| key.clone())
                 .last()
@@ -281,7 +296,10 @@ impl Node {
 
     fn is_internal(&self) -> bool {
         match self.node_type {
-            NodeType::Internal { children, keys } => true,
+            NodeType::Internal {
+                children: _,
+                keys: _,
+            } => true,
             NodeType::Leaf {
                 kvs: _,
                 next_leaf: _,
@@ -309,8 +327,8 @@ impl Node {
     /// Returns internal's node children. Returns error when node's a Leaf.
     pub fn children_pointers(&self) -> anyhow::Result<Vec<Pointer>> {
         match &self.node_type {
-            NodeType::Internal { children, keys } => {
-                let mut pointers: Vec<Pointer> = children.iter().map(|p| *p).collect();
+            NodeType::Internal { children, keys: _ } => {
+                let pointers: Vec<Pointer> = children.to_vec();
 
                 Ok(pointers)
             }
@@ -318,6 +336,20 @@ impl Node {
                 kvs: _,
                 next_leaf: _,
             } => bail!("children_pointers called on Leaf node"),
+        }
+    }
+
+    pub fn contains(&self, wanted: &Key) -> bool {
+        match &self.node_type {
+            NodeType::Internal { children: _, keys } => keys.contains(wanted),
+            NodeType::Leaf { kvs, next_leaf: _ } => {
+                for (key, _) in kvs {
+                    if key == wanted {
+                        return true;
+                    }
+                }
+                false
+            }
         }
     }
 
@@ -406,23 +438,25 @@ impl TryFrom<Page> for Node {
         let mut offset = LEAF_NODE_HEADER_SIZE;
         match node_type {
             InternalNodeType::Internal {
-                mut child_pointer_pairs,
+                child_pointer_pairs: _,
                 is_index,
             } => {
+                let mut children = vec![];
+                let mut keys = vec![];
                 for _ in 0..num_cells {
                     let pointer = Pointer(
                         pointer_from_bytes(&data, offset)
                             .context("could not parse child pointer")?,
                     );
                     offset += POINTER_SIZE;
-                    let key = data[offset..offset + value.key_size].to_vec();
-                    offset += value.key_size;
-
-                    child_pointer_pairs.push((pointer, Key(key)));
+                    children.push(pointer);
                 }
 
-                let (children, keys): (Vec<Pointer>, Vec<Key>) =
-                    child_pointer_pairs.into_iter().map(|(a, b)| (a, b)).unzip();
+                for _ in 0..num_cells - 1 {
+                    let key = Key(data[offset..offset + value.key_size].to_vec());
+                    offset += value.key_size;
+                    keys.push(key);
+                }
 
                 Ok(Self::new(
                     NodeType::Internal { children, keys },
@@ -498,13 +532,11 @@ impl TryFrom<Node> for [u8; PAGE_SIZE] {
 
         match val.node_type {
             NodeType::Internal { children, keys } => {
-                let child_pointer_pairs = children
-                    .into_iter()
-                    .zip(keys)
-                    .collect::<Vec<(Pointer, Key)>>();
-                for (pointer, Key(key)) in child_pointer_pairs {
-                    buf[offset..offset + POINTER_SIZE].copy_from_slice(&pointer.0.to_be_bytes());
+                for Pointer(child) in children {
+                    buf[offset..offset + POINTER_SIZE].copy_from_slice(&child.to_be_bytes());
                     offset += POINTER_SIZE;
+                }
+                for Key(key) in keys {
                     buf[offset..offset + val.key_size].copy_from_slice(&key);
                     offset += val.key_size;
                 }
@@ -520,10 +552,13 @@ impl TryFrom<Node> for [u8; PAGE_SIZE] {
                     val.row_size
                 };
 
+                // dbg!(&kvs.len());
                 for (Key(key), v) in kvs {
-                    buf[offset..offset + val.key_size].copy_from_slice(&key);
+                    copy_from_slice(&mut buf[offset..offset + val.key_size], &key)?;
+                    // buf[offset..offset + val.key_size].copy_from_slice(&key);
                     offset += val.key_size;
-                    buf[offset..offset + row_size].copy_from_slice(&v);
+                    copy_from_slice(&mut buf[offset..offset + val.row_size], &v)?;
+                    // buf[offset..offset + row_size].copy_from_slice(&v);
                     offset += row_size;
                 }
             }
@@ -531,6 +566,19 @@ impl TryFrom<Node> for [u8; PAGE_SIZE] {
 
         Ok(buf)
     }
+}
+
+fn copy_from_slice(buffer: &mut [u8], v: &Vec<u8>) -> anyhow::Result<()> {
+    if buffer.len() != v.len() {
+        bail!(
+            "buffer {} and vector {}{:?} len does not match",
+            buffer.len(),
+            v.len(),
+            String::from_utf8(v.to_vec())?
+        );
+    }
+    buffer.copy_from_slice(v);
+    Ok(())
 }
 
 fn pointer_from_bytes(data: &[u8], offset: usize) -> anyhow::Result<u32> {

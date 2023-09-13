@@ -1297,9 +1297,7 @@ mod tests {
         )?;
 
         for (i, row) in rows.into_iter().enumerate() {
-            if i == 15 {
-                dbg!(i);
-            }
+            if i == 15 {}
             db.insert(row.into())?;
         }
         db.print_short(0, "".to_string())?;

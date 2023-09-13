@@ -7,7 +7,10 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.69"
+derive_more = {version = "0.99.17", features = ["display"]}
+
 tempdir = "0.3.7"
 
 [dev-dependencies]
 tempfile = "3.4.0"
+rand = "0.8.5"
